@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-TTS — demo</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --ink: #1c1b19; --muted: #6b6864;
+    --line: #e3e0dc; --accent: #2f6f4e; --accent-ink: #fff; --warn: #a4441f;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --panel: #1f2124; --ink: #eceae7; --muted: #9a968f;
+      --line: #32353a; --accent: #6fbf95; --accent-ink: #12241a; --warn: #e88f63;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 1.75rem; font-size: .9rem; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1.25rem;
+  }
+  .panel h2 { font-size: 1.02rem; margin: 0 0 .2rem; }
+  .panel .hint { color: var(--muted); font-size: .85rem; margin: 0 0 1rem; }
+  label { display: block; font-size: .8rem; font-weight: 600; margin: .85rem 0 .3rem; }
+  label .opt { font-weight: 400; color: var(--muted); }
+  input[type=text], textarea, select, input[type=file] {
+    width: 100%; padding: .55rem .65rem; font: inherit; font-size: .9rem;
+    color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 7px;
+  }
+  textarea { resize: vertical; min-height: 4.5em; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; }
+  .row > * { flex: 1 1 200px; }
+  button {
+    margin-top: 1.1rem; padding: .6rem 1.1rem; font: inherit; font-weight: 600;
+    font-size: .9rem; color: var(--accent-ink); background: var(--accent);
+    border: 0; border-radius: 7px; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .status { margin-top: .9rem; font-size: .85rem; color: var(--muted); min-height: 1.4em; }
+  .status.err { color: var(--warn); }
+  audio { width: 100%; margin-top: .9rem; }
+  .step {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); border-top: 1px solid var(--line);
+    padding-top: .9rem; margin-top: 1.1rem;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Qwen3-TTS</h1>
+  <p class="sub">Local demo against <code id="api"></code></p>
+
+  <!-- ------------------------------ TTS ------------------------------ -->
+  <div class="panel">
+    <h2>Text to speech</h2>
+    <p class="hint">Pick a voice, or leave it on <em>Describe a voice</em> and write what it should
+      sound like. Both go to the same endpoint — <code>POST /v1/tts</code>.</p>
+
+    <label for="t-text">Text</label>
+    <textarea id="t-text">Hello! This is the Qwen3 text to speech engine, running locally.</textarea>
+
+    <div class="row">
+      <div>
+        <label for="t-voice">Voice</label>
+        <select id="t-voice"><option value="">Describe a voice instead…</option></select>
+      </div>
+      <div>
+        <label for="t-lang">Language <span class="opt">— optional</span></label>
+        <select id="t-lang"></select>
+      </div>
+    </div>
+
+    <label for="t-instruct">
+      Voice description / style <span class="opt" id="t-instruct-req"></span>
+    </label>
+    <input type="text" id="t-instruct" placeholder="e.g. An elderly wizard, deep and gravelly">
+
+    <button id="t-go">Generate</button>
+    <div class="status" id="t-status"></div>
+    <audio id="t-audio" controls hidden></audio>
+  </div>
+
+  <!-- ----------------------------- CLONE ----------------------------- -->
+  <div class="panel">
+    <h2>Voice clone</h2>
+    <p class="hint">Upload a clip. It is transcribed automatically so you can check and correct the
+      transcript before generating — an accurate transcript measurably improves the clone.</p>
+
+    <div class="step">Step 1 — upload a sample</div>
+    <label for="c-file">Reference audio</label>
+    <input type="file" id="c-file" accept="audio/*">
+
+    <div class="step">Step 2 — check the transcript</div>
+    <label for="c-reftext">Transcript <span class="opt">— auto-filled, edit if wrong</span></label>
+    <textarea id="c-reftext" placeholder="Upload a clip and its transcript appears here…"></textarea>
+    <div class="status" id="c-trstatus"></div>
+
+    <div class="step">Step 3 — generate</div>
+    <label for="c-text">Text to speak in that voice</label>
+    <textarea id="c-text">This sentence is being spoken in a cloned voice.</textarea>
+
+    <label for="c-lang">Language <span class="opt">— optional</span></label>
+    <select id="c-lang"></select>
+
+    <button id="c-go" disabled>Generate</button>
+    <div class="status" id="c-status"></div>
+    <audio id="c-audio" controls hidden></audio>
+  </div>
+</div>
+
+<script>
+const API = location.origin;
+document.getElementById("api").textContent = API;
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(el, msg, isErr = false) {
+  el.textContent = msg;
+  el.classList.toggle("err", isErr);
+}
+
+async function readError(res) {
+  try {
+    const j = await res.json();
+    if (Array.isArray(j.detail)) return j.detail.map(d => d.msg).join("; ");
+    return j.detail || JSON.stringify(j);
+  } catch { return `${res.status} ${res.statusText}`; }
+}
+
+function playInto(audioEl, blob) {
+  audioEl.src = URL.createObjectURL(blob);
+  audioEl.hidden = false;
+  audioEl.play().catch(() => {});   // autoplay may be blocked; controls still work
+}
+
+// ---- populate the dropdowns from the API -------------------------------- //
+(async function init() {
+  const [voices, langs] = await Promise.all([
+    fetch(`${API}/v1/voices`).then(r => r.json()),
+    fetch(`${API}/v1/languages`).then(r => r.json()),
+  ]);
+
+  const vsel = $("t-voice");
+  for (const v of voices.voices) {
+    const o = document.createElement("option");
+    o.value = v.id;
+    o.textContent = `${v.id} — ${v.description}`;
+    vsel.appendChild(o);
+  }
+
+  for (const sel of [$("t-lang"), $("c-lang")]) {
+    for (const l of langs.languages) {
+      const o = document.createElement("option");
+      o.value = l;
+      o.textContent = l === "auto" ? "auto-detect" : l;
+      sel.appendChild(o);
+    }
+  }
+  syncInstructLabel();
+})();
+
+// instruct is mandatory only when no voice is selected
+function syncInstructLabel() {
+  const described = !$("t-voice").value;
+  $("t-instruct-req").textContent = described ? "— required" : "— optional";
+  $("t-instruct").placeholder = described
+    ? "e.g. An elderly wizard, deep and gravelly"
+    : "e.g. Speak in a furious, sharp tone";
+}
+$("t-voice").addEventListener("change", syncInstructLabel);
+
+// ---- TTS ---------------------------------------------------------------- //
+$("t-go").addEventListener("click", async () => {
+  const btn = $("t-go"), status = $("t-status");
+  const speaker = $("t-voice").value;
+  const instruct = $("t-instruct").value.trim();
+
+  if (!speaker && !instruct) {
+    setStatus(status, "Pick a voice, or describe one.", true);
+    return;
+  }
+
+  btn.disabled = true;
+  setStatus(status, "Generating…");
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`${API}/v1/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: $("t-text").value,
+        speaker: speaker || undefined,
+        instruct: instruct || undefined,
+        language: $("t-lang").value,
+        response_format: "wav",
+      }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    playInto($("t-audio"), await res.blob());
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    setStatus(status, `Done in ${secs}s — ${speaker ? `voice “${speaker}”` : "described voice"}.`);
+  } catch (e) {
+    setStatus(status, e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- Clone: step 1+2, transcribe on upload ------------------------------ //
+$("c-file").addEventListener("change", async () => {
+  const file = $("c-file").files[0];
+  const status = $("c-trstatus");
+  if (!file) return;
+
+  $("c-go").disabled = true;
+  setStatus(status, "Transcribing…");
+  try {
+    const fd = new FormData();
+    fd.append("audio", file);
+    const res = await fetch(`${API}/v1/transcribe/upload`, { method: "POST", body: fd });
+    if (!res.ok) throw new Error(await readError(res));
+    const { text, seconds } = await res.json();
+    $("c-reftext").value = text;
+    setStatus(status, `Transcribed in ${seconds}s. Check it, and correct it if needed.`);
+  } catch (e) {
+    setStatus(status, `${e.message} — you can type the transcript yourself.`, true);
+  } finally {
+    $("c-go").disabled = false;
+  }
+});
+
+// ---- Clone: step 3, generate ------------------------------------------- //
+$("c-go").addEventListener("click", async () => {
+  const btn = $("c-go"), status = $("c-status");
+  const file = $("c-file").files[0];
+  if (!file) { setStatus(status, "Upload a reference clip first.", true); return; }
+
+  btn.disabled = true;
+  setStatus(status, "Generating…");
+  const t0 = performance.now();
+  try {
+    const fd = new FormData();
+    fd.append("text", $("c-text").value);
+    fd.append("ref_audio", file);
+    fd.append("language", $("c-lang").value);
+    fd.append("response_format", "wav");
+    const refText = $("c-reftext").value.trim();
+    if (refText) fd.append("ref_text", refText);   // omit -> server transcribes
+
+    const res = await fetch(`${API}/v1/tts/clone/upload`, { method: "POST", body: fd });
+    if (!res.ok) throw new Error(await readError(res));
+    playInto($("c-audio"), await res.blob());
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const used = res.headers.get("X-Reference-Text");
+    setStatus(status, `Done in ${secs}s.` + (used ? ` Transcript used: “${used}”` : ""));
+  } catch (e) {
+    setStatus(status, e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

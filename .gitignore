@@ -1,0 +1,29 @@
+# Model weights - ~14 GB, far over GitHub's limits. Downloaded by DEPLOY_RUNPOD.md step 4.
+models/
+
+# Virtual environment - recreate with the steps in DEPLOY_RUNPOD.md
+venv/
+.venv/
+
+# Upstream Qwen3-TTS is its own git repo; clone it separately rather than nesting it
+Qwen3-TTS/
+
+# Generated audio and registered voices
+test_output/
+saved_voices/
+*.wav
+
+# Secrets and local config
+.env
+*.pem
+*.key
+
+# Logs and scratch
+*.log
+*.err
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
