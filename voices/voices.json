@@ -1,0 +1,18 @@
+{
+  "voices": [
+    {
+      "id": "aria_soul",
+      "name": "Aria",
+      "description": "Soulful female vocalist, warm and unhurried",
+      "language": "english",
+      "ref_text": "Every song starts somewhere quiet, long before anybody hears it."
+    },
+    {
+      "id": "marcus_baritone",
+      "name": "Marcus",
+      "description": "Resonant male baritone, steady and deliberate",
+      "language": "english",
+      "ref_text": "I have sung in rooms so small the walls sang back at me."
+    }
+  ]
+}

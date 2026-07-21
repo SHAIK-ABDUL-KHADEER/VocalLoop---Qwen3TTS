@@ -13,6 +13,10 @@ test_output/
 saved_voices/
 *.wav
 
+# ...but the vocalist library IS part of the project. Sample clips are small and
+# make the repo testable out of the box; swap them for your own recordings.
+!voices/*.wav
+
 # Secrets and local config
 .env
 *.pem

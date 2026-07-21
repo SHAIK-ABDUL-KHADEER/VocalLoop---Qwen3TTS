@@ -1,17 +1,21 @@
-"""Qwen3-TTS HTTP API.
+"""Qwen3-TTS HTTP API — one endpoint for every mode.
 
-Three audio endpoints:
+    POST /v1/speak
 
-    POST /v1/tts             one endpoint for both TTS modes:
-                               speaker given   -> CustomVoice model (instruct optional)
-                               no speaker      -> VoiceDesign model (instruct required)
-    POST /v1/tts/clone       clone a voice from a reference clip
-    POST /v1/transcribe      speech-to-text, so the frontend can show the
-                             auto-generated reference transcript for editing
+The request decides which model runs. Exactly one *voice source* may be given:
 
-Reference transcripts are produced automatically: if `ref_text` is omitted from a
-clone request the server transcribes `ref_audio` with Whisper. Callers may still
-pass `ref_text` to skip that step (faster, and exact).
+    voice source        mode              model
+    ------------------  ----------------  ---------------------
+    (none)              described_voice   VoiceDesign 1.7B   instruct REQUIRED
+    speaker             built_in_voice    CustomVoice 1.7B   instruct optional
+    voice_id            vocalist_clone    Base 1.7B          curated vocalist clip
+    audio               voice_clone       Base 1.7B          user-supplied clip
+
+Supporting endpoints are metadata only: GET /v1/voices (populate the picker) and
+GET /health.
+
+Reference transcripts for cloning are produced automatically with Whisper when
+not supplied; for vocalist voices the transcript is cached so it is computed once.
 
 Deliberately not exposed, per spec:
   - model size: always 1.7B, the largest released
@@ -24,6 +28,7 @@ Everything auto-tunes to the GPU present, so the same file runs unedited on an
 
 Config via environment variables (all optional):
     QWEN_TTS_MODEL_DIR     model folders (default <repo>/models)
+    QWEN_TTS_VOICE_DIR     vocalist clips + voices.json (default <repo>/voices)
     QWEN_TTS_DEVICE        cuda:0 if a GPU is present, else cpu
     QWEN_TTS_MAX_RESIDENT  TTS models on the GPU at once (3 if >=24 GB, 2 if >=16, else 1)
     QWEN_TTS_ASR_MODEL     ASR model dir or hub id (default <MODEL_DIR>/whisper-large-v3-turbo)
@@ -40,11 +45,13 @@ import base64
 import gc
 import importlib.util
 import io
+import json
 import os
 import re
 import secrets
 import threading
 import time
+import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -52,10 +59,14 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+# Starlette's UploadFile, NOT fastapi.UploadFile: request.form() yields the former,
+# and fastapi's is a subclass - so isinstance against fastapi's silently misses.
+from starlette.datastructures import UploadFile
 
 from qwen_tts import Qwen3TTSModel
 
@@ -73,6 +84,7 @@ _TOTAL_VRAM_GB = (
 )
 
 MODEL_DIR = os.environ.get("QWEN_TTS_MODEL_DIR", os.path.join(REPO_ROOT, "models"))
+VOICE_DIR = os.environ.get("QWEN_TTS_VOICE_DIR", os.path.join(REPO_ROOT, "voices"))
 DEVICE = os.environ.get("QWEN_TTS_DEVICE") or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Each TTS model is ~4.2 GB. Keeping all three resident needs headroom for KV
@@ -98,7 +110,6 @@ _HAS_FLASH_ATTN = importlib.util.find_spec("flash_attn") is not None
 ATTN = os.environ.get("QWEN_TTS_ATTN") or ("flash_attention_2" if _HAS_FLASH_ATTN else "sdpa")
 
 # Auth + CORS are env-driven so deploying needs no code edits.
-# Unset API key = open server (fine locally, not on a public host).
 API_KEY = os.environ.get("QWEN_TTS_API_KEY") or None
 CORS_ORIGINS = [
     o.strip() for o in os.environ.get("QWEN_TTS_CORS_ORIGINS", "*").split(",") if o.strip()
@@ -110,8 +121,7 @@ MODEL_PATHS = {
     "base": os.path.join(MODEL_DIR, "Qwen3-TTS-12Hz-1.7B-Base"),
 }
 
-# Speaker descriptions from the model card, surfaced through /v1/voices so the
-# frontend can render a labelled picker.
+# The 9 voices shipped with the CustomVoice model.
 SPEAKER_INFO = {
     "vivian": ("Bright, slightly edgy young female voice.", "Chinese"),
     "serena": ("Warm, gentle young female voice.", "Chinese"),
@@ -129,6 +139,97 @@ LANGUAGES = [
     "japanese", "korean", "portuguese", "russian", "spanish",
 ]
 
+AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")
+
+
+# --------------------------------------------------------------------------- #
+# Vocalist voice library
+# --------------------------------------------------------------------------- #
+#
+# Curated reference clips you supply, cloned on demand. Drop an audio file into
+# VOICE_DIR and it becomes selectable; voices.json only adds display metadata.
+# A clip's transcript is needed for high-quality cloning, so it is transcribed
+# once on first use and written back to voices.json.
+
+_voice_lib_lock = threading.Lock()
+
+
+def _manifest_path() -> str:
+    return os.path.join(VOICE_DIR, "voices.json")
+
+
+def _read_manifest() -> Dict[str, Dict[str, Any]]:
+    path = _manifest_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[voices] WARNING could not read {path}: {e}")
+        return {}
+    entries = data.get("voices", data) if isinstance(data, dict) else data
+    return {e["id"]: e for e in entries if isinstance(e, dict) and e.get("id")}
+
+
+def _write_manifest(by_id: Dict[str, Dict[str, Any]]) -> None:
+    os.makedirs(VOICE_DIR, exist_ok=True)
+    tmp = _manifest_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"voices": list(by_id.values())}, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, _manifest_path())
+
+
+def list_vocalists() -> List[Dict[str, Any]]:
+    """Every audio file in VOICE_DIR, enriched with any voices.json metadata."""
+    if not os.path.isdir(VOICE_DIR):
+        return []
+    meta = _read_manifest()
+    out = []
+    for fn in sorted(os.listdir(VOICE_DIR)):
+        if not fn.lower().endswith(AUDIO_EXTS):
+            continue
+        vid = os.path.splitext(fn)[0]
+        m = meta.get(vid, {})
+        out.append({
+            "id": vid,
+            "name": m.get("name") or vid.replace("_", " ").title(),
+            "description": m.get("description", ""),
+            "language": m.get("language", "auto"),
+            "file": fn,
+            "has_transcript": bool(m.get("ref_text")),
+        })
+    return out
+
+
+def vocalist_clip(voice_id: str) -> Tuple[str, Optional[str]]:
+    """Resolve a vocalist id to (audio path, cached transcript or None)."""
+    safe = os.path.basename(voice_id)
+    if not os.path.isdir(VOICE_DIR):
+        raise HTTPException(status_code=404, detail=f"No voice library at {VOICE_DIR}.")
+    for fn in sorted(os.listdir(VOICE_DIR)):
+        if os.path.splitext(fn)[0] == safe and fn.lower().endswith(AUDIO_EXTS):
+            meta = _read_manifest().get(safe, {})
+            return os.path.join(VOICE_DIR, fn), (meta.get("ref_text") or None)
+    available = [v["id"] for v in list_vocalists()]
+    raise HTTPException(
+        status_code=404,
+        detail=f"Unknown voice_id '{voice_id}'. Available: {available or 'none'}",
+    )
+
+
+def cache_vocalist_transcript(voice_id: str, ref_text: str) -> None:
+    """Persist a transcript so a vocalist clip is only ever transcribed once."""
+    with _voice_lib_lock:
+        meta = _read_manifest()
+        entry = meta.get(voice_id, {"id": voice_id})
+        entry["ref_text"] = ref_text
+        meta[voice_id] = entry
+        try:
+            _write_manifest(meta)
+        except OSError as e:  # a read-only volume must not break generation
+            print(f"[voices] WARNING could not cache transcript for {voice_id}: {e}")
+
 
 # --------------------------------------------------------------------------- #
 # Model registry - lazy load with LRU eviction so this runs on small GPUs too
@@ -143,17 +244,17 @@ class ModelRegistry:
     def get(self, kind: str) -> Qwen3TTSModel:
         """Fetch a model, loading and evicting as needed.
 
-        MUST be called while holding `gpu_lock`, and the returned model must only
-        be used while that same lock is still held. Eviction frees the evicted
-        model's CUDA storage, so if another request could evict between the get
-        and the generate, it would pull the weights out from under a running call
-        and raise "index is on cpu, different from other tensors on cuda:0".
+        MUST be called while holding `gpu_lock`, and the returned model may only
+        be used while that lock is still held. Eviction frees the evicted model's
+        CUDA storage, so if another request could evict between the get and the
+        generate it would pull the weights out from under a running call and raise
+        "index is on cpu, different from other tensors on cuda:0".
 
-        Note that eviction itself is fragile on small GPUs: repeatedly loading and
-        freeing a ~4 GB model kills the CUDA process outright on Windows after a
-        handful of cycles (native crash, no traceback). Keeping MAX_RESIDENT >=
-        the number of models in use avoids eviction entirely, which is what the
-        auto-tuned default does on any card with room for it.
+        Eviction is also fragile on small GPUs: repeatedly loading and freeing a
+        ~4 GB model can kill the CUDA process outright on Windows (native crash,
+        no traceback). Keeping MAX_RESIDENT >= the number of models in use avoids
+        eviction entirely, which is what the auto-tuned default does when there is
+        room for it.
         """
         with self._load_lock:
             if kind in self._models:
@@ -184,14 +285,16 @@ class ModelRegistry:
 
     @staticmethod
     def _release(kind: str, model: Qwen3TTSModel) -> None:
-        """Drop an evicted model. The caller deletes its reference, then runs
-        gc.collect() + empty_cache(), which is what actually frees the VRAM.
+        """Move weights off the GPU before dropping the reference.
 
-        Do NOT `.to("cpu")` here. That copies ~4.2 GB into system RAM on every
-        swap; with the incoming model also staging through RAM, a 16 GB machine
-        runs out and Windows kills the process outright - no traceback, just a
-        dead server. Dropping the last reference frees the CUDA storage directly.
+        empty_cache() alone only returns *cached* blocks; the parameters have to
+        actually lose their CUDA storage or VRAM keeps climbing until the card
+        (or, on Windows, shared system memory) runs out.
         """
+        try:
+            model.model.to("cpu")
+        except Exception as e:
+            print(f"[registry] warning: could not move '{kind}' to cpu: {e}")
         print(f"[registry] evicted '{kind}' to free VRAM")
 
     def resident(self) -> List[str]:
@@ -204,9 +307,9 @@ registry = ModelRegistry()
 # to call concurrently from multiple threads.
 gpu_lock = threading.Lock()
 
-# The ASR model is deliberately kept OUT of the LRU pool above. It is small
-# (~1.6 GB) and every clone request needs it, so evicting a TTS model to make
-# room for it - then evicting it again to reload the TTS model - would thrash.
+# The ASR model is deliberately kept OUT of the LRU pool above: it is small and
+# every un-transcribed clone needs it, so evicting a TTS model to make room and
+# then evicting it again would thrash.
 _asr = None
 _asr_lock = threading.Lock()
 
@@ -248,63 +351,10 @@ GEN_PARAM_FIELDS = (
 ResponseFormat = Literal["json", "wav"]
 
 
-class GenParams(BaseModel):
-    """Optional sampling knobs shared by every TTS endpoint."""
-
-    max_new_tokens: Optional[int] = None
-    do_sample: Optional[bool] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    temperature: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    subtalker_dosample: Optional[bool] = None
-    subtalker_top_k: Optional[int] = None
-    subtalker_top_p: Optional[float] = None
-    subtalker_temperature: Optional[float] = None
-
-    def kwargs(self) -> Dict[str, Any]:
-        # Only the generation fields - subclasses add text/speaker/etc, and those
-        # are passed explicitly, so leaking them here would duplicate them.
-        dumped = self.model_dump()
-        return {k: dumped[k] for k in GEN_PARAM_FIELDS if dumped.get(k) is not None}
-
-
 def wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
-
-
-def audio_response(
-    wavs: List[np.ndarray],
-    sr: int,
-    response_format: str,
-    elapsed: float,
-    extra: Optional[Dict[str, Any]] = None,
-):
-    """Raw WAV bytes (single item only) or JSON with base64 audio."""
-    if response_format == "wav":
-        if len(wavs) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail="response_format='wav' requires exactly one text item; use 'json' for batches.",
-            )
-        headers = {}
-        # The transcript can't go in a JSON body here, so surface it in a header.
-        if extra and extra.get("ref_text"):
-            headers["X-Reference-Text"] = extra["ref_text"].encode("ascii", "replace").decode()
-        return Response(content=wav_bytes(wavs[0], sr), media_type="audio/wav", headers=headers)
-
-    payload: Dict[str, Any] = {
-        "sample_rate": sr,
-        "count": len(wavs),
-        "durations": [round(len(w) / sr, 3) for w in wavs],
-        "generation_seconds": round(elapsed, 3),
-        "audio": [base64.b64encode(wav_bytes(w, sr)).decode("ascii") for w in wavs],
-    }
-    if extra:
-        payload.update(extra)
-    return JSONResponse(payload)
 
 
 def as_list(x: Union[str, List[str]]) -> List[str]:
@@ -349,30 +399,45 @@ def decode_upload(data: bytes) -> str:
 
 
 def load_audio_np(ref: str) -> Tuple[np.ndarray, int]:
-    """Resolve a URL / path / base64 / data-URI reference into a waveform."""
-    ref = normalize_audio_ref(ref)
-    if ref.startswith(("http://", "https://")):
-        import urllib.request
+    """Resolve a URL / path / base64 / data-URI reference into a waveform.
 
-        with urllib.request.urlopen(ref) as resp:
-            raw = resp.read()
-        wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-    elif ref.startswith("data:"):
-        raw = base64.b64decode(ref.split(",", 1)[1])
-        wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-    else:
-        wav, sr = sf.read(ref, dtype="float32", always_2d=False)
+    Callers resolve the clip once and pass the waveform on to both transcription
+    and generation. Letting the library re-resolve a URL itself would download it
+    a second time, and a network failure there escapes as an opaque 500 instead of
+    the 502 raised here.
+    """
+    ref = normalize_audio_ref(ref)
+    try:
+        if ref.startswith(("http://", "https://")):
+            try:
+                with urllib.request.urlopen(ref, timeout=60) as resp:
+                    raw = resp.read()
+            except (urllib.error.URLError, OSError) as e:
+                raise HTTPException(
+                    status_code=502, detail=f"Could not fetch reference audio from {ref}: {e}"
+                ) from e
+            wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        elif ref.startswith("data:"):
+            raw = base64.b64decode(ref.split(",", 1)[1])
+            wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        else:
+            import librosa
+
+            wav, sr = librosa.load(ref, sr=None, mono=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read audio: {e}") from e
     if wav.ndim > 1:
         wav = wav.mean(axis=-1)
     return wav.astype(np.float32), int(sr)
 
 
-def transcribe(ref_audio: str) -> str:
-    """Speech-to-text for a reference clip. Raises 400 if nothing intelligible."""
-    wav, sr = load_audio_np(ref_audio)
+def transcribe_wav(wav: np.ndarray, sr: int) -> str:
+    """Speech-to-text for an already-loaded waveform. 400 if nothing intelligible."""
     asr = get_asr()
     if ASR_DEVICE == "cpu":
-        # No GPU involved, so don't block TTS generation behind it.
+        # No GPU involved, so don't block generation behind it.
         out = asr({"array": wav, "sampling_rate": sr})
     else:
         with gpu_lock:
@@ -387,66 +452,131 @@ def transcribe(ref_audio: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Schemas
+# Request schema
 # --------------------------------------------------------------------------- #
 
 
-class TTSRequest(GenParams):
-    """One endpoint, two modes.
-
-    speaker present -> CustomVoice model, instruct optional (style control)
-    speaker absent  -> VoiceDesign model, instruct required (voice description)
-    """
+class SpeakRequest(BaseModel):
+    """The single request shape. Which fields are set decides which model runs."""
 
     text: Union[str, List[str]] = Field(..., description="Text to speak. Required.")
+
+    # --- voice sources: at most one --------------------------------------- #
     speaker: Optional[Union[str, List[str]]] = Field(
-        None,
-        description="One of the 9 built-in voices (see GET /v1/voices). "
-                    "Omit to describe a voice with `instruct` instead.",
+        None, description="A built-in voice id. See GET /v1/voices -> built_in."
     )
+    voice_id: Optional[str] = Field(
+        None, description="A vocalist voice id to clone. See GET /v1/voices -> vocalist."
+    )
+    audio: Optional[str] = Field(
+        None,
+        description="Reference clip to clone: URL, server path, base64, or data URI. "
+                    "With multipart, send a file in this field instead.",
+    )
+
+    # --- modifiers --------------------------------------------------------- #
     instruct: Optional[Union[str, List[str]]] = Field(
         None,
-        description="Voice description. Required when `speaker` is omitted; "
-                    "optional style control when `speaker` is given.",
+        description="Voice description (required when no voice source is given) or "
+                    "style instruction for a built-in voice. Ignored when cloning.",
+    )
+    ref_text: Optional[str] = Field(
+        None, description="Transcript of the reference clip. Transcribed automatically if omitted."
     )
     language: Optional[Union[str, List[str]]] = Field(None, description="Defaults to 'auto'.")
     response_format: ResponseFormat = "json"
 
+    # --- generation knobs -------------------------------------------------- #
+    max_new_tokens: Optional[int] = None
+    do_sample: Optional[bool] = None
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    temperature: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    subtalker_dosample: Optional[bool] = None
+    subtalker_top_k: Optional[int] = None
+    subtalker_top_p: Optional[float] = None
+    subtalker_temperature: Optional[float] = None
+
+    def gen_kwargs(self) -> Dict[str, Any]:
+        dumped = self.model_dump()
+        return {k: dumped[k] for k in GEN_PARAM_FIELDS if dumped.get(k) is not None}
+
     @model_validator(mode="after")
-    def _require_instruct_without_speaker(self):
-        if not self.speaker and not self.instruct:
+    def _one_voice_source(self):
+        given = [n for n in ("speaker", "voice_id", "audio") if getattr(self, n)]
+        if len(given) > 1:
             raise ValueError(
-                "Provide `speaker` to use a built-in voice, or `instruct` to describe one."
+                f"Give at most one voice source, got {given}. "
+                "Use `speaker` for a built-in voice, `voice_id` for a vocalist voice, "
+                "`audio` to clone an uploaded clip, or none of them with `instruct` "
+                "to have a voice generated from your description."
+            )
+        if not given and not self.instruct:
+            raise ValueError(
+                "Provide a voice source (`speaker`, `voice_id`, or `audio`), or "
+                "`instruct` to describe the voice you want."
             )
         return self
 
-
-class CloneRequest(GenParams):
-    """Base model: reproduce the voice in a reference clip."""
-
-    text: Union[str, List[str]] = Field(..., description="Text to speak. Required.")
-    ref_audio: str = Field(
-        ..., description="Reference clip: URL, server path, base64 WAV, or data URI. Required."
-    )
-    ref_text: Optional[str] = Field(
-        None,
-        description="Transcript of ref_audio. Omit and the server transcribes it automatically.",
-    )
-    language: Optional[Union[str, List[str]]] = Field(None, description="Defaults to 'auto'.")
-    response_format: ResponseFormat = "json"
+    @property
+    def mode(self) -> str:
+        if self.audio:
+            return "voice_clone"
+        if self.voice_id:
+            return "vocalist_clone"
+        if self.speaker:
+            return "built_in_voice"
+        return "described_voice"
 
 
-class TranscribeRequest(BaseModel):
-    audio: str = Field(..., description="URL, server path, base64 WAV, or data URI.")
+# Form fields that are not part of the model but carry the uploaded file.
+_FILE_FIELDS = ("audio", "file", "ref_audio")
+
+
+async def parse_speak_request(request: Request) -> SpeakRequest:
+    """Build a SpeakRequest from either a JSON body or multipart form data.
+
+    One endpoint has to accept both: JSON for ordinary calls and batches,
+    multipart so a browser can post a file straight from an <input type=file>.
+    """
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+    if ctype == "multipart/form-data":
+        form = await request.form()
+        payload: Dict[str, Any] = {}
+        for key, value in form.multi_items():
+            if isinstance(value, UploadFile):
+                if key in _FILE_FIELDS:
+                    payload["audio"] = decode_upload(await value.read())
+                continue
+            if value == "":  # empty form inputs mean "not provided"
+                continue
+            payload[key] = value
+    else:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail="Body must be JSON, or multipart/form-data when uploading a file.",
+            ) from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object.")
+
+    try:
+        return SpeakRequest(**payload)
+    except ValidationError as e:
+        # 422 with the same shape FastAPI produces for declared models.
+        raise HTTPException(status_code=422, detail=json.loads(e.json())) from e
 
 
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 
-
-# Left open even when a key is set: /health so load balancers and RunPod probes
-# can reach it, /demo and the docs so they are usable in a browser.
+# Left open even when a key is set: /health for load balancers and RunPod probes,
+# /demo and the docs so they stay usable in a browser.
 PUBLIC_PATHS = {"/health", "/demo", "/docs", "/redoc", "/openapi.json"}
 
 
@@ -466,6 +596,7 @@ async def lifespan(app: FastAPI):
     print(f"[startup] gpu          : {gpu} ({_TOTAL_VRAM_GB:.1f} GB)")
     print(f"[startup] device       : {DEVICE}")
     print(f"[startup] model dir    : {MODEL_DIR}")
+    print(f"[startup] voice dir    : {VOICE_DIR} ({len(list_vocalists())} vocalist voices)")
     print(f"[startup] max resident : {MAX_RESIDENT}")
     print(f"[startup] attn impl    : {ATTN}")
     print(f"[startup] asr model    : {ASR_MODEL} on {ASR_DEVICE}")
@@ -481,8 +612,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Qwen3-TTS API",
-    version="3.0.0",
-    description="Text-to-speech with built-in voices, described voices, and voice cloning.",
+    version="4.0.0",
+    description="One endpoint for described voices, built-in voices, vocalist voices, and cloning.",
     lifespan=lifespan,
     dependencies=[Depends(require_api_key)],
 )
@@ -492,133 +623,147 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,  # set QWEN_TTS_CORS_ORIGINS to your site before going public
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Reference-Text"],
+    expose_headers=["X-Mode", "X-Reference-Text"],
 )
 
 
-# ------------------------------ TTS endpoints ------------------------------ #
+# ------------------------------ the endpoint ------------------------------- #
 
 
-@app.post("/v1/tts", tags=["tts"])
-def tts(req: TTSRequest):
-    """Text to speech.
+@app.post("/v1/speak", tags=["speech"])
+async def speak(request: Request):
+    """Generate speech. The request decides which model runs.
 
-    Pass `speaker` to use one of the 9 built-in voices (`instruct` then optionally
-    restyles it). Omit `speaker` and pass `instruct` to have a voice generated from
-    your description. `language` defaults to auto-detect.
+    | voice source | mode | notes |
+    |---|---|---|
+    | none | `described_voice` | `instruct` required - the voice is invented from it |
+    | `speaker` | `built_in_voice` | one of the 9 built-ins; `instruct` optionally restyles |
+    | `voice_id` | `vocalist_clone` | clones a curated vocalist clip |
+    | `audio` | `voice_clone` | clones the supplied clip (JSON string or multipart file) |
+
+    Accepts `application/json` or `multipart/form-data`.
     """
+    req = await parse_speak_request(request)
     texts = as_list(req.text)
     n = len(texts)
+    mode = req.mode
+    warnings: List[str] = []
+    info: Dict[str, Any] = {}
 
-    if req.speaker:
-        with gpu_lock:
+    # --- resolve the reference clip for the two cloning modes -------------- #
+    ref_clip: Optional[Tuple[np.ndarray, int]] = None
+    ref_text: Optional[str] = req.ref_text.strip() if req.ref_text else None
+
+    if mode in ("vocalist_clone", "voice_clone"):
+        if mode == "vocalist_clone":
+            path, cached = vocalist_clip(req.voice_id)
+            source, ref_text = path, (ref_text or cached)
+            info["voice_id"] = req.voice_id
+        else:
+            source = normalize_audio_ref(req.audio)
+
+        if req.instruct:
+            warnings.append(
+                "`instruct` is not supported when cloning a voice and was ignored."
+            )
+
+        # Resolved once here and handed to both steps below.
+        ref_clip = load_audio_np(source)
+
+        if not ref_text:
+            ref_text = transcribe_wav(*ref_clip)
+            info["ref_text_auto_generated"] = True
+            if mode == "vocalist_clone":
+                cache_vocalist_transcript(req.voice_id, ref_text)
+        else:
+            info["ref_text_auto_generated"] = False
+        info["ref_text"] = ref_text
+
+    # --- generate ----------------------------------------------------------- #
+    languages = broadcast(req.language or "auto", n, "language")
+    gen = req.gen_kwargs()
+
+    with gpu_lock:
+        t0 = time.time()
+        if mode == "built_in_voice":
             model = registry.get("custom_voice")
-            t0 = time.time()
             wavs, sr = model.generate_custom_voice(
                 text=texts,
                 speaker=broadcast(req.speaker, n, "speaker"),
-                language=broadcast(req.language or "auto", n, "language"),
+                language=languages,
                 instruct=broadcast(req.instruct, n, "instruct") if req.instruct else None,
-                **req.kwargs(),
+                **gen,
             )
-            elapsed = time.time() - t0
-        return audio_response(wavs, sr, req.response_format, elapsed, {"mode": "built_in_voice"})
-
-    with gpu_lock:
-        model = registry.get("voice_design")
-        t0 = time.time()
-        wavs, sr = model.generate_voice_design(
-            text=texts,
-            instruct=broadcast(req.instruct, n, "instruct"),
-            language=broadcast(req.language or "auto", n, "language"),
-            **req.kwargs(),
-        )
+        elif mode == "described_voice":
+            model = registry.get("voice_design")
+            wavs, sr = model.generate_voice_design(
+                text=texts,
+                instruct=broadcast(req.instruct, n, "instruct"),
+                language=languages,
+                **gen,
+            )
+        else:
+            model = registry.get("base")
+            wavs, sr = model.generate_voice_clone(
+                text=texts,
+                language=languages,
+                ref_audio=ref_clip,   # (waveform, sample_rate), already resolved
+                ref_text=ref_text,
+                **gen,
+            )
         elapsed = time.time() - t0
-    return audio_response(wavs, sr, req.response_format, elapsed, {"mode": "described_voice"})
+
+    # --- respond ------------------------------------------------------------ #
+    if req.response_format == "wav":
+        if len(wavs) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format='wav' returns a single file; use 'json' for batches.",
+            )
+        headers = {"X-Mode": mode}
+        if info.get("ref_text"):
+            # Header values must be latin-1; fall back rather than 500 on non-ASCII.
+            try:
+                info["ref_text"].encode("latin-1")
+                headers["X-Reference-Text"] = info["ref_text"]
+            except UnicodeEncodeError:
+                pass
+        return Response(content=wav_bytes(wavs[0], sr), media_type="audio/wav", headers=headers)
+
+    payload: Dict[str, Any] = {
+        "mode": mode,
+        "sample_rate": sr,
+        "count": len(wavs),
+        "durations": [round(len(w) / sr, 3) for w in wavs],
+        "generation_seconds": round(elapsed, 3),
+        "audio": [base64.b64encode(wav_bytes(w, sr)).decode("ascii") for w in wavs],
+        **info,
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return JSONResponse(payload)
 
 
-@app.post("/v1/tts/clone", tags=["tts"])
-def tts_clone(req: CloneRequest):
-    """Clone the voice in a reference clip.
-
-    `ref_text` is optional - omit it and the reference audio is transcribed
-    automatically. The transcript used is returned as `ref_text` in the response
-    (or the `X-Reference-Text` header when response_format is 'wav').
-    """
-    ref_audio = normalize_audio_ref(req.ref_audio)
-    ref_text = req.ref_text.strip() if req.ref_text else None
-    auto = ref_text is None
-    if auto:
-        ref_text = transcribe(ref_audio)
-
-    texts = as_list(req.text)
-    n = len(texts)
-    with gpu_lock:
-        model = registry.get("base")
-        t0 = time.time()
-        wavs, sr = model.generate_voice_clone(
-            text=texts,
-            language=broadcast(req.language or "auto", n, "language"),
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            **req.kwargs(),
-        )
-        elapsed = time.time() - t0
-    return audio_response(
-        wavs, sr, req.response_format, elapsed,
-        {"ref_text": ref_text, "ref_text_auto_generated": auto},
-    )
+# ----------------------------- metadata ------------------------------------ #
 
 
-@app.post("/v1/tts/clone/upload", tags=["tts"])
-async def tts_clone_upload(
-    text: str = Form(..., description="Text to speak."),
-    ref_audio: UploadFile = File(..., description="Reference audio file."),
-    ref_text: Optional[str] = Form(None, description="Optional; transcribed automatically if omitted."),
-    language: Optional[str] = Form(None),
-    response_format: ResponseFormat = Form("json"),
-):
-    """Same as /v1/tts/clone but takes a multipart file upload - use this from a browser."""
-    data = await ref_audio.read()
-    return tts_clone(
-        CloneRequest(
-            text=text,
-            ref_audio=decode_upload(data),
-            ref_text=ref_text,
-            language=language,
-            response_format=response_format,
-        )
-    )
-
-
-# ------------------------------ transcription ------------------------------ #
-
-
-@app.post("/v1/transcribe", tags=["tts"])
-def transcribe_json(req: TranscribeRequest):
-    """Transcribe audio. Call this when the user uploads a clip so you can show
-    them the auto-generated reference text and let them correct it."""
-    t0 = time.time()
-    text = transcribe(req.audio)
-    return {"text": text, "seconds": round(time.time() - t0, 3)}
-
-
-@app.post("/v1/transcribe/upload", tags=["tts"])
-async def transcribe_upload(audio: UploadFile = File(...)):
-    """Multipart variant of /v1/transcribe."""
-    data = await audio.read()
-    t0 = time.time()
-    text = transcribe(decode_upload(data))
-    return {"text": text, "seconds": round(time.time() - t0, 3)}
-
-
-# ----------------------------- meta endpoints ------------------------------ #
+@app.get("/v1/voices", tags=["meta"])
+def list_voices():
+    """Everything the voice picker needs: built-in voices, vocalist voices, languages."""
+    return {
+        "built_in": [
+            {"id": sid, "name": sid.replace("_", " ").title(),
+             "description": desc, "native_language": lang}
+            for sid, (desc, lang) in SPEAKER_INFO.items()
+        ],
+        "vocalist": list_vocalists(),
+        "languages": LANGUAGES,
+    }
 
 
 @app.get("/demo", tags=["meta"], include_in_schema=False)
 def demo_page():
-    """A small self-contained page exercising both endpoints, including the
-    upload -> transcribe -> review -> clone flow. Handy for manual testing."""
+    """Self-contained page exercising every mode. Handy for manual testing."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "demo.html")
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="demo.html not found")
@@ -641,6 +786,7 @@ def health():
         "gpu": gpu,
         "resident_models": registry.resident(),
         "asr_loaded": _asr is not None,
+        "vocalist_voices": len(list_vocalists()),
         # Auto-tuned at startup - check these to confirm you are on the GPU.
         "config": {
             "device": DEVICE,
@@ -651,23 +797,6 @@ def health():
         },
         "models_downloaded": {k: os.path.isdir(p) for k, p in MODEL_PATHS.items()},
     }
-
-
-@app.get("/v1/voices", tags=["meta"])
-def list_voices():
-    """The 9 built-in voices. Populate your voice picker from this."""
-    return {
-        "voices": [
-            {"id": sid, "description": desc, "native_language": lang}
-            for sid, (desc, lang) in SPEAKER_INFO.items()
-        ]
-    }
-
-
-@app.get("/v1/languages", tags=["meta"])
-def list_languages():
-    """Language dropdown. 'auto' is the default everywhere."""
-    return {"languages": LANGUAGES}
 
 
 if __name__ == "__main__":

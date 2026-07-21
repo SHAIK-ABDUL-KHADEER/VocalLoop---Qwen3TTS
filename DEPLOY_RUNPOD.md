@@ -210,16 +210,31 @@ A first-call warm-up of ~10–20 s per model is normal; after that all three sta
 
 ## 7. Point your website at it
 
+There is one endpoint, `POST /v1/speak`, and the fields you send pick the mode:
+
 ```js
 const API = "https://<POD_ID>-9000.proxy.runpod.net";
 const KEY = process.env.QWEN_TTS_API_KEY;   // server-side only, never ship to the browser
 
-const res = await fetch(`${API}/v1/tts`, {
+const res = await fetch(`${API}/v1/speak`, {
   method: "POST",
   headers: { "Content-Type": "application/json", "X-API-Key": KEY },
-  body: JSON.stringify({ text, speaker, instruct, language: "auto", response_format: "wav" }),
+  body: JSON.stringify({
+    text,
+    // exactly one of these three, or none of them with `instruct`:
+    speaker,        // built-in voice   -> built_in_voice
+    // voice_id,    // vocalist library -> vocalist_clone
+    // audio,       // url/base64 clip  -> voice_clone
+    instruct,       // required only when no voice source is given
+    language: "auto",
+    response_format: "wav",
+  }),
 });
 ```
+
+For an uploaded file, post `multipart/form-data` to the same URL with the clip in an
+`audio` field. Populate your voice picker from `GET /v1/voices`, which returns built-in
+voices, vocalist voices, and languages in one call.
 
 **Do not put the API key in browser JavaScript** — anyone could read it and spend your GPU
 time. Proxy these calls through your own backend, which holds the key. If you must call
@@ -256,14 +271,25 @@ recreation. Rebuilding the container disk alone will not lose them.
 at deploy time, fire one request per mode:
 
 ```bash
-curl -X POST localhost:9000/v1/tts -H 'Content-Type: application/json' \
-  -H "X-API-Key: $QWEN_TTS_API_KEY" -d '{"text":"warm up","speaker":"ryan"}'
-curl -X POST localhost:9000/v1/tts -H 'Content-Type: application/json' \
-  -H "X-API-Key: $QWEN_TTS_API_KEY" -d '{"text":"warm up","instruct":"a calm voice"}'
-curl -X POST localhost:9000/v1/transcribe -H 'Content-Type: application/json' \
-  -H "X-API-Key: $QWEN_TTS_API_KEY" \
-  -d '{"audio":"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"}'
+H="Content-Type: application/json"
+K="X-API-Key: $QWEN_TTS_API_KEY"
+REF=https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav
+
+# CustomVoice
+curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
+  -d '{"text":"warm up","speaker":"ryan"}'
+# VoiceDesign
+curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
+  -d '{"text":"warm up","instruct":"a calm voice"}'
+# Base + Whisper
+curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
+  -d "{\"text\":\"warm up\",\"audio\":\"$REF\"}"
 ```
+
+**Vocalist voices.** Copy your reference clips into `/workspace/vocalloop/voices/` — the
+filename stem becomes the `voice_id`. They are picked up without a restart. Keeping them on
+the volume means transcripts stay cached across pod restarts. See
+[voices/README.md](voices/README.md).
 
 ---
 

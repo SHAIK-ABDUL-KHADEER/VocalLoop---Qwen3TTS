@@ -27,7 +27,7 @@ function Start-Server {
     return $p
 }
 
-$families = if ($Filter) { @($Filter) } else { @("tts_described", "tts_speaker", "clone", "transcribe") }
+$families = if ($Filter) { @($Filter) } else { @("described", "builtin", "vocalist", "clone", "err") }
 
 foreach ($f in $families) {
     Write-Host "`n########## family: $f ##########" -ForegroundColor Cyan

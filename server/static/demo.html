@@ -6,267 +6,262 @@
 <title>Qwen3-TTS — demo</title>
 <style>
   :root {
-    --bg: #fbfbfa; --panel: #fff; --ink: #1c1b19; --muted: #6b6864;
-    --line: #e3e0dc; --accent: #2f6f4e; --accent-ink: #fff; --warn: #a4441f;
-    --radius: 10px;
+    --bg:#fbfbfa; --panel:#fff; --ink:#1c1b19; --muted:#6b6864;
+    --line:#e3e0dc; --accent:#2f6f4e; --accent-ink:#fff; --warn:#a4441f;
+    --chip:#f1efec;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #17181a; --panel: #1f2124; --ink: #eceae7; --muted: #9a968f;
-      --line: #32353a; --accent: #6fbf95; --accent-ink: #12241a; --warn: #e88f63;
+      --bg:#17181a; --panel:#1f2124; --ink:#eceae7; --muted:#9a968f;
+      --line:#32353a; --accent:#6fbf95; --accent-ink:#12241a; --warn:#e88f63;
+      --chip:#2a2d31;
     }
   }
-  * { box-sizing: border-box; }
+  * { box-sizing:border-box; }
   body {
-    margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--ink);
-    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin:0; padding:2rem 1rem 4rem; background:var(--bg); color:var(--ink);
+    font:15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  .wrap { max-width: 860px; margin: 0 auto; }
-  h1 { font-size: 1.4rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
-  .sub { color: var(--muted); margin: 0 0 1.75rem; font-size: .9rem; }
+  .wrap { max-width:780px; margin:0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 .2rem; letter-spacing:-.01em; }
+  .sub { color:var(--muted); margin:0 0 1.5rem; font-size:.88rem; }
   .panel {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1.25rem;
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:1.25rem; margin-bottom:1.1rem;
   }
-  .panel h2 { font-size: 1.02rem; margin: 0 0 .2rem; }
-  .panel .hint { color: var(--muted); font-size: .85rem; margin: 0 0 1rem; }
-  label { display: block; font-size: .8rem; font-weight: 600; margin: .85rem 0 .3rem; }
-  label .opt { font-weight: 400; color: var(--muted); }
+  label { display:block; font-size:.8rem; font-weight:600; margin:.9rem 0 .3rem; }
+  label:first-child { margin-top:0; }
+  label .opt { font-weight:400; color:var(--muted); }
   input[type=text], textarea, select, input[type=file] {
-    width: 100%; padding: .55rem .65rem; font: inherit; font-size: .9rem;
-    color: var(--ink); background: var(--bg);
-    border: 1px solid var(--line); border-radius: 7px;
+    width:100%; padding:.55rem .65rem; font:inherit; font-size:.9rem;
+    color:var(--ink); background:var(--bg);
+    border:1px solid var(--line); border-radius:7px;
   }
-  textarea { resize: vertical; min-height: 4.5em; }
-  .row { display: flex; gap: .75rem; flex-wrap: wrap; }
-  .row > * { flex: 1 1 200px; }
+  textarea { resize:vertical; min-height:4em; }
+  .row { display:flex; gap:.75rem; flex-wrap:wrap; }
+  .row > * { flex:1 1 200px; }
   button {
-    margin-top: 1.1rem; padding: .6rem 1.1rem; font: inherit; font-weight: 600;
-    font-size: .9rem; color: var(--accent-ink); background: var(--accent);
-    border: 0; border-radius: 7px; cursor: pointer;
+    margin-top:1.1rem; padding:.6rem 1.15rem; font:inherit; font-weight:600;
+    font-size:.9rem; color:var(--accent-ink); background:var(--accent);
+    border:0; border-radius:7px; cursor:pointer;
   }
-  button:disabled { opacity: .55; cursor: default; }
-  .status { margin-top: .9rem; font-size: .85rem; color: var(--muted); min-height: 1.4em; }
-  .status.err { color: var(--warn); }
-  audio { width: 100%; margin-top: .9rem; }
-  .step {
-    font-size: .72rem; text-transform: uppercase; letter-spacing: .07em;
-    color: var(--muted); border-top: 1px solid var(--line);
-    padding-top: .9rem; margin-top: 1.1rem;
+  button:disabled { opacity:.55; cursor:default; }
+  .status { margin-top:.9rem; font-size:.85rem; color:var(--muted); min-height:1.4em; }
+  .status.err { color:var(--warn); }
+  audio { width:100%; margin-top:.9rem; }
+  code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.85em; }
+  .mode {
+    display:inline-block; padding:.15rem .5rem; border-radius:5px;
+    background:var(--chip); font-family:ui-monospace, Menlo, monospace; font-size:.78rem;
   }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  .explain { font-size:.83rem; color:var(--muted); margin:.55rem 0 0; }
+  details { margin-top:1rem; }
+  summary { cursor:pointer; font-size:.85rem; color:var(--muted); }
+  pre {
+    background:var(--chip); padding:.75rem; border-radius:7px;
+    overflow-x:auto; font-size:.8rem; margin:.6rem 0 0;
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Qwen3-TTS</h1>
-  <p class="sub">Local demo against <code id="api"></code></p>
+  <p class="sub">One endpoint — <code>POST /v1/speak</code> on <code id="api"></code>.
+     What you fill in decides which model runs.</p>
 
-  <!-- ------------------------------ TTS ------------------------------ -->
   <div class="panel">
-    <h2>Text to speech</h2>
-    <p class="hint">Pick a voice, or leave it on <em>Describe a voice</em> and write what it should
-      sound like. Both go to the same endpoint — <code>POST /v1/tts</code>.</p>
+    <label for="text">Text to speak</label>
+    <textarea id="text">Hello! This is the Qwen3 text to speech engine, running locally.</textarea>
 
-    <label for="t-text">Text</label>
-    <textarea id="t-text">Hello! This is the Qwen3 text to speech engine, running locally.</textarea>
+    <label for="voice">Voice</label>
+    <select id="voice">
+      <option value="">— none: describe the voice instead —</option>
+    </select>
+    <p class="explain" id="voice-explain"></p>
+
+    <label for="upload">Or upload a clip to clone <span class="opt">— overrides the voice above</span></label>
+    <input type="file" id="upload" accept="audio/*">
+
+    <label for="reftext">Reference transcript
+      <span class="opt">— optional; auto-transcribed when left blank</span></label>
+    <textarea id="reftext" placeholder="Only used when cloning an uploaded clip."></textarea>
+
+    <label for="instruct" id="instruct-label">Voice description</label>
+    <input type="text" id="instruct" placeholder="e.g. An elderly wizard, deep and gravelly">
 
     <div class="row">
       <div>
-        <label for="t-voice">Voice</label>
-        <select id="t-voice"><option value="">Describe a voice instead…</option></select>
-      </div>
-      <div>
-        <label for="t-lang">Language <span class="opt">— optional</span></label>
-        <select id="t-lang"></select>
+        <label for="lang">Language <span class="opt">— optional</span></label>
+        <select id="lang"></select>
       </div>
     </div>
 
-    <label for="t-instruct">
-      Voice description / style <span class="opt" id="t-instruct-req"></span>
-    </label>
-    <input type="text" id="t-instruct" placeholder="e.g. An elderly wizard, deep and gravelly">
+    <button id="go">Generate</button>
+    <div class="status" id="status"></div>
+    <audio id="audio" controls hidden></audio>
 
-    <button id="t-go">Generate</button>
-    <div class="status" id="t-status"></div>
-    <audio id="t-audio" controls hidden></audio>
-  </div>
-
-  <!-- ----------------------------- CLONE ----------------------------- -->
-  <div class="panel">
-    <h2>Voice clone</h2>
-    <p class="hint">Upload a clip. It is transcribed automatically so you can check and correct the
-      transcript before generating — an accurate transcript measurably improves the clone.</p>
-
-    <div class="step">Step 1 — upload a sample</div>
-    <label for="c-file">Reference audio</label>
-    <input type="file" id="c-file" accept="audio/*">
-
-    <div class="step">Step 2 — check the transcript</div>
-    <label for="c-reftext">Transcript <span class="opt">— auto-filled, edit if wrong</span></label>
-    <textarea id="c-reftext" placeholder="Upload a clip and its transcript appears here…"></textarea>
-    <div class="status" id="c-trstatus"></div>
-
-    <div class="step">Step 3 — generate</div>
-    <label for="c-text">Text to speak in that voice</label>
-    <textarea id="c-text">This sentence is being spoken in a cloned voice.</textarea>
-
-    <label for="c-lang">Language <span class="opt">— optional</span></label>
-    <select id="c-lang"></select>
-
-    <button id="c-go" disabled>Generate</button>
-    <div class="status" id="c-status"></div>
-    <audio id="c-audio" controls hidden></audio>
+    <details>
+      <summary>Request this will send</summary>
+      <pre id="preview"></pre>
+    </details>
   </div>
 </div>
 
 <script>
 const API = location.origin;
 document.getElementById("api").textContent = API;
-
 const $ = (id) => document.getElementById(id);
 
-function setStatus(el, msg, isErr = false) {
-  el.textContent = msg;
-  el.classList.toggle("err", isErr);
+let VOICES = { built_in: [], vocalist: [] };
+
+function setStatus(msg, isErr = false) {
+  $("status").innerHTML = msg;
+  $("status").classList.toggle("err", isErr);
 }
 
 async function readError(res) {
   try {
     const j = await res.json();
-    if (Array.isArray(j.detail)) return j.detail.map(d => d.msg).join("; ");
+    if (Array.isArray(j.detail)) return j.detail.map(d => d.msg || JSON.stringify(d)).join("; ");
     return j.detail || JSON.stringify(j);
   } catch { return `${res.status} ${res.statusText}`; }
 }
 
-function playInto(audioEl, blob) {
-  audioEl.src = URL.createObjectURL(blob);
-  audioEl.hidden = false;
-  audioEl.play().catch(() => {});   // autoplay may be blocked; controls still work
+// Mirror the server's routing so the UI explains itself.
+function currentMode() {
+  if ($("upload").files.length) return "voice_clone";
+  const v = $("voice").value;
+  if (v.startsWith("vocalist:")) return "vocalist_clone";
+  if (v.startsWith("builtin:")) return "built_in_voice";
+  return "described_voice";
 }
 
-// ---- populate the dropdowns from the API -------------------------------- //
+const EXPLAIN = {
+  voice_clone:     "Uploaded clip wins — cloning it. <span class='mode'>voice_clone</span>",
+  vocalist_clone:  "Cloning a vocalist from the library. <span class='mode'>vocalist_clone</span>",
+  built_in_voice:  "Using a built-in voice; a description restyles it. <span class='mode'>built_in_voice</span>",
+  described_voice: "No voice picked, so one is invented from your description. <span class='mode'>described_voice</span>",
+};
+
+function syncUI() {
+  const mode = currentMode();
+  $("voice-explain").innerHTML = EXPLAIN[mode];
+
+  const cloning = mode === "voice_clone" || mode === "vocalist_clone";
+  const described = mode === "described_voice";
+
+  $("instruct-label").innerHTML = described
+    ? "Voice description <span class='opt'>— required</span>"
+    : cloning ? "Voice description <span class='opt'>— ignored when cloning</span>"
+              : "Style instruction <span class='opt'>— optional</span>";
+  $("instruct").disabled = cloning;
+  $("instruct").placeholder = described
+    ? "e.g. An elderly wizard, deep and gravelly"
+    : cloning ? "Not used in this mode"
+              : "e.g. Speak in a furious, sharp tone";
+
+  $("reftext").disabled = mode !== "voice_clone";
+  $("voice").disabled = mode === "voice_clone";
+  $("preview").textContent = JSON.stringify(buildBody(mode), null, 2);
+}
+
+function buildBody(mode) {
+  const body = { text: $("text").value, language: $("lang").value, response_format: "wav" };
+  if (mode === "voice_clone") {
+    body.audio = "<uploaded file>";
+    if ($("reftext").value.trim()) body.ref_text = $("reftext").value.trim();
+  } else if (mode === "vocalist_clone") {
+    body.voice_id = $("voice").value.split(":")[1];
+  } else if (mode === "built_in_voice") {
+    body.speaker = $("voice").value.split(":")[1];
+    if ($("instruct").value.trim()) body.instruct = $("instruct").value.trim();
+  } else {
+    body.instruct = $("instruct").value.trim();
+  }
+  return body;
+}
+
 (async function init() {
-  const [voices, langs] = await Promise.all([
-    fetch(`${API}/v1/voices`).then(r => r.json()),
-    fetch(`${API}/v1/languages`).then(r => r.json()),
-  ]);
+  const v = await fetch(`${API}/v1/voices`).then(r => r.json());
+  VOICES = v;
+  const sel = $("voice");
 
-  const vsel = $("t-voice");
-  for (const v of voices.voices) {
-    const o = document.createElement("option");
-    o.value = v.id;
-    o.textContent = `${v.id} — ${v.description}`;
-    vsel.appendChild(o);
-  }
-
-  for (const sel of [$("t-lang"), $("c-lang")]) {
-    for (const l of langs.languages) {
+  if (v.built_in.length) {
+    const g = document.createElement("optgroup");
+    g.label = "Built-in voices";
+    for (const b of v.built_in) {
       const o = document.createElement("option");
-      o.value = l;
-      o.textContent = l === "auto" ? "auto-detect" : l;
-      sel.appendChild(o);
+      o.value = `builtin:${b.id}`;
+      o.textContent = `${b.name} — ${b.description}`;
+      g.appendChild(o);
     }
+    sel.appendChild(g);
   }
-  syncInstructLabel();
+  if (v.vocalist.length) {
+    const g = document.createElement("optgroup");
+    g.label = "Vocalist voices (cloned)";
+    for (const t of v.vocalist) {
+      const o = document.createElement("option");
+      o.value = `vocalist:${t.id}`;
+      o.textContent = t.description ? `${t.name} — ${t.description}` : t.name;
+      g.appendChild(o);
+    }
+    sel.appendChild(g);
+  }
+
+  for (const l of v.languages) {
+    const o = document.createElement("option");
+    o.value = l;
+    o.textContent = l === "auto" ? "auto-detect" : l;
+    $("lang").appendChild(o);
+  }
+  syncUI();
 })();
 
-// instruct is mandatory only when no voice is selected
-function syncInstructLabel() {
-  const described = !$("t-voice").value;
-  $("t-instruct-req").textContent = described ? "— required" : "— optional";
-  $("t-instruct").placeholder = described
-    ? "e.g. An elderly wizard, deep and gravelly"
-    : "e.g. Speak in a furious, sharp tone";
+for (const id of ["voice", "upload", "text", "instruct", "reftext", "lang"]) {
+  $(id).addEventListener("input", syncUI);
+  $(id).addEventListener("change", syncUI);
 }
-$("t-voice").addEventListener("change", syncInstructLabel);
 
-// ---- TTS ---------------------------------------------------------------- //
-$("t-go").addEventListener("click", async () => {
-  const btn = $("t-go"), status = $("t-status");
-  const speaker = $("t-voice").value;
-  const instruct = $("t-instruct").value.trim();
-
-  if (!speaker && !instruct) {
-    setStatus(status, "Pick a voice, or describe one.", true);
-    return;
-  }
-
+$("go").addEventListener("click", async () => {
+  const mode = currentMode();
+  const btn = $("go");
   btn.disabled = true;
-  setStatus(status, "Generating…");
+  setStatus("Generating…");
   const t0 = performance.now();
+
   try {
-    const res = await fetch(`${API}/v1/tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: $("t-text").value,
-        speaker: speaker || undefined,
-        instruct: instruct || undefined,
-        language: $("t-lang").value,
-        response_format: "wav",
-      }),
-    });
+    let res;
+    if (mode === "voice_clone") {
+      // Multipart, because the clip is a real file from the user's disk.
+      const fd = new FormData();
+      fd.append("text", $("text").value);
+      fd.append("audio", $("upload").files[0]);
+      fd.append("language", $("lang").value);
+      fd.append("response_format", "wav");
+      if ($("reftext").value.trim()) fd.append("ref_text", $("reftext").value.trim());
+      res = await fetch(`${API}/v1/speak`, { method: "POST", body: fd });
+    } else {
+      res = await fetch(`${API}/v1/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildBody(mode)),
+      });
+    }
     if (!res.ok) throw new Error(await readError(res));
-    playInto($("t-audio"), await res.blob());
+
+    const blob = await res.blob();
+    $("audio").src = URL.createObjectURL(blob);
+    $("audio").hidden = false;
+    $("audio").play().catch(() => {});   // autoplay may be blocked; controls still work
+
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    setStatus(status, `Done in ${secs}s — ${speaker ? `voice “${speaker}”` : "described voice"}.`);
+    const served = res.headers.get("X-Mode") || mode;
+    const ref = res.headers.get("X-Reference-Text");
+    setStatus(`Done in ${secs}s — <span class="mode">${served}</span>` +
+              (ref ? `<br>transcript used: “${ref}”` : ""));
   } catch (e) {
-    setStatus(status, e.message, true);
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-// ---- Clone: step 1+2, transcribe on upload ------------------------------ //
-$("c-file").addEventListener("change", async () => {
-  const file = $("c-file").files[0];
-  const status = $("c-trstatus");
-  if (!file) return;
-
-  $("c-go").disabled = true;
-  setStatus(status, "Transcribing…");
-  try {
-    const fd = new FormData();
-    fd.append("audio", file);
-    const res = await fetch(`${API}/v1/transcribe/upload`, { method: "POST", body: fd });
-    if (!res.ok) throw new Error(await readError(res));
-    const { text, seconds } = await res.json();
-    $("c-reftext").value = text;
-    setStatus(status, `Transcribed in ${seconds}s. Check it, and correct it if needed.`);
-  } catch (e) {
-    setStatus(status, `${e.message} — you can type the transcript yourself.`, true);
-  } finally {
-    $("c-go").disabled = false;
-  }
-});
-
-// ---- Clone: step 3, generate ------------------------------------------- //
-$("c-go").addEventListener("click", async () => {
-  const btn = $("c-go"), status = $("c-status");
-  const file = $("c-file").files[0];
-  if (!file) { setStatus(status, "Upload a reference clip first.", true); return; }
-
-  btn.disabled = true;
-  setStatus(status, "Generating…");
-  const t0 = performance.now();
-  try {
-    const fd = new FormData();
-    fd.append("text", $("c-text").value);
-    fd.append("ref_audio", file);
-    fd.append("language", $("c-lang").value);
-    fd.append("response_format", "wav");
-    const refText = $("c-reftext").value.trim();
-    if (refText) fd.append("ref_text", refText);   // omit -> server transcribes
-
-    const res = await fetch(`${API}/v1/tts/clone/upload`, { method: "POST", body: fd });
-    if (!res.ok) throw new Error(await readError(res));
-    playInto($("c-audio"), await res.blob());
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    const used = res.headers.get("X-Reference-Text");
-    setStatus(status, `Done in ${secs}s.` + (used ? ` Transcript used: “${used}”` : ""));
-  } catch (e) {
-    setStatus(status, e.message, true);
+    setStatus(e.message, true);
   } finally {
     btn.disabled = false;
   }

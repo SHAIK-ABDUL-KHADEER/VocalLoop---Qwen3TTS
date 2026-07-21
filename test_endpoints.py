@@ -1,4 +1,4 @@
-"""Exercise every Qwen3-TTS API endpoint and save the audio it returns.
+"""Exercise every mode of POST /v1/speak and save the audio it returns.
 
     python test_endpoints.py [--base-url http://127.0.0.1:9000] [--filter clone]
 
@@ -19,173 +19,214 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 results = []
 FILTER = None
+API_KEY = None
 
 
 def save_audio(name, b64):
-    path = os.path.join(OUT_DIR, f"{name}.wav")
-    with open(path, "wb") as f:
+    with open(os.path.join(OUT_DIR, f"{name}.wav"), "wb") as f:
         f.write(base64.b64decode(b64))
-    return path
 
 
-def check(name, method, url, *, expect=200, save_as=None, **kw):
+def check(name, method, url, *, expect=200, **kw):
     if FILTER and FILTER not in name:
         return None
+    if API_KEY:
+        kw.setdefault("headers", {})["X-API-Key"] = API_KEY
+
     t0 = time.time()
     try:
-        r = requests.request(method, url, timeout=1200, **kw)
+        r = requests.request(method, url, timeout=1800, **kw)
     except Exception as e:
-        results.append((name, "ERROR", 0, str(e)[:120]))
+        results.append((name, "ERROR", str(e)[:120]))
         print(f"  [ERROR] {name}: {e}")
         return None
 
     elapsed = time.time() - t0
     ok = r.status_code == expect
-    note = ""
+    note, body = "", None
 
     if ok and r.headers.get("content-type", "").startswith("audio/wav"):
-        with open(os.path.join(OUT_DIR, f"{save_as or name}.wav"), "wb") as f:
+        with open(os.path.join(OUT_DIR, f"{name}.wav"), "wb") as f:
             f.write(r.content)
-        note = f"{len(r.content)/1024:.0f} KB wav"
-        hdr = r.headers.get("X-Reference-Text")
-        if hdr:
-            note += f' | hdr ref_text="{hdr[:40]}"'
-        body = None
+        note = f"{len(r.content)/1024:.0f} KB wav | X-Mode={r.headers.get('X-Mode')}"
     elif ok:
         try:
             body = r.json()
         except Exception:
-            body, note = None, "non-JSON body"
+            note = "non-JSON body"
         if isinstance(body, dict) and body.get("audio"):
             for i, b64 in enumerate(body["audio"]):
                 suffix = "" if len(body["audio"]) == 1 else f"_{i+1}"
-                save_audio(f"{save_as or name}{suffix}", b64)
+                save_audio(f"{name}{suffix}", b64)
             note = (f"{body['count']} clip(s), {sum(body['durations']):.1f}s audio "
-                    f"in {body.get('generation_seconds', 0):.1f}s")
-            if body.get("mode"):
-                note += f" | mode={body['mode']}"
+                    f"in {body.get('generation_seconds', 0):.1f}s | mode={body.get('mode')}")
             if body.get("ref_text"):
                 auto = "auto" if body.get("ref_text_auto_generated") else "given"
-                note += f' | {auto} ref_text="{body["ref_text"][:38]}"'
-        elif isinstance(body, dict) and "text" in body:
-            note = f'"{body["text"][:60]}"'
+                note += f' | {auto} ref="{body["ref_text"][:32]}"'
+            if body.get("warnings"):
+                note += f" | warn={len(body['warnings'])}"
+        elif isinstance(body, dict) and "built_in" in body:
+            note = (f"{len(body['built_in'])} built-in, {len(body['vocalist'])} vocalist, "
+                    f"{len(body['languages'])} languages")
     else:
-        body = None
         try:
-            note = json.dumps(r.json())[:140]
+            note = json.dumps(r.json())[:150]
         except Exception:
-            note = r.text[:140]
+            note = r.text[:150]
 
     status = "PASS" if ok else "FAIL"
     print(f"  [{status}] {name}  ({r.status_code}, {elapsed:.1f}s) {note}")
-    results.append((name, status, elapsed, note))
+    results.append((name, status, note))
     return body if ok else None
 
 
 def main():
-    global FILTER
+    global FILTER, API_KEY
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:9000")
     ap.add_argument("--filter", default=None, help="only run checks whose name contains this")
+    ap.add_argument("--api-key", default=os.environ.get("QWEN_TTS_API_KEY"))
     args = ap.parse_args()
     B = args.base_url.rstrip("/")
-    FILTER = args.filter
+    FILTER, API_KEY = args.filter, args.api_key
 
+    SPEAK = f"{B}/v1/speak"
     ref_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
     ref_text = ("Okay. Yeah. I resent you. I love you. I respect you. But you know what? "
                 "You blew it! And thanks to you.")
 
-    print("\n=== meta ===")
+    print("\n=== metadata ===")
     check("health", "GET", f"{B}/health")
     check("voices", "GET", f"{B}/v1/voices")
-    check("languages", "GET", f"{B}/v1/languages")
 
-    print("\n=== /v1/tts  -  no speaker -> described voice ===")
-    check("tts_described", "POST", f"{B}/v1/tts",
+    # Fetched unconditionally, outside check(), because --filter would otherwise
+    # skip it and every vocalist test would silently self-skip for lack of ids.
+    vocalists = []
+    try:
+        hdr = {"X-API-Key": API_KEY} if API_KEY else {}
+        vocalists = [v["id"] for v in
+                     requests.get(f"{B}/v1/voices", headers=hdr, timeout=60).json()["vocalist"]]
+        print(f"         vocalist voices: {vocalists or 'none installed'}")
+    except Exception as e:
+        print(f"         could not list vocalist voices: {e}")
+
+    print("\n=== mode: described_voice  (no voice source) ===")
+    check("described", "POST", SPEAK,
           json={"text": "Welcome, traveller. You have journeyed far to reach this place.",
                 "instruct": "An elderly wizard, deep gravelly voice, slow and wise.",
                 "language": "english"})
-    check("tts_described_autolang", "POST", f"{B}/v1/tts",
+    check("described_autolang", "POST", SPEAK,
           json={"text": "Bonjour, comment allez-vous aujourd'hui?",
                 "instruct": "A warm, friendly woman in her thirties."})
-    check("tts_described_batch", "POST", f"{B}/v1/tts",
+    check("described_batch", "POST", SPEAK,
           json={"text": ["Get down, now!", "It is going to be alright, I promise."],
                 "instruct": ["Urgent military commander, clipped and forceful.",
                              "A soft, reassuring nurse, warm and calm."],
                 "language": "english"})
 
-    print("\n=== /v1/tts  -  speaker given -> built-in voice ===")
-    check("tts_speaker", "POST", f"{B}/v1/tts",
+    print("\n=== mode: built_in_voice  (speaker) ===")
+    check("builtin", "POST", SPEAK,
           json={"text": "Hello, this is the Qwen3 text to speech engine speaking.",
                 "speaker": "ryan", "language": "english"})
-    check("tts_speaker_instruct", "POST", f"{B}/v1/tts",
+    check("builtin_instruct", "POST", SPEAK,
           json={"text": "I cannot believe you did that. This is unacceptable.",
                 "speaker": "vivian", "language": "english",
                 "instruct": "Speak in a furious, sharp tone."})
-    check("tts_speaker_autolang", "POST", f"{B}/v1/tts",
-          json={"text": "Language left unspecified, so it should auto-detect.",
-                "speaker": "aiden"})
-    check("tts_speaker_batch", "POST", f"{B}/v1/tts",
+    check("builtin_batch", "POST", SPEAK,
           json={"text": ["The first sentence is spoken here.",
                          "And the second sentence follows after it."],
                 "speaker": ["ryan", "aiden"], "language": "english"})
-    check("tts_speaker_params", "POST", f"{B}/v1/tts",
+    check("builtin_params", "POST", SPEAK,
           json={"text": "Testing sampling parameters end to end.", "speaker": "aiden",
                 "language": "english", "temperature": 0.7, "top_p": 0.9, "top_k": 40,
                 "do_sample": True})
-    check("tts_wav_bytes", "POST", f"{B}/v1/tts",
+    check("builtin_wav_bytes", "POST", SPEAK,
           json={"text": "This response is raw wav bytes, not JSON.", "speaker": "ryan",
                 "language": "english", "response_format": "wav"})
 
-    print("\n=== /v1/tts  -  validation ===")
-    check("tts_missing_text", "POST", f"{B}/v1/tts", expect=422,
-          json={"instruct": "Text is mandatory so this must fail."})
-    check("tts_no_speaker_no_instruct", "POST", f"{B}/v1/tts", expect=422,
-          json={"text": "Neither speaker nor instruct given, so this must fail."})
-    check("tts_bad_speaker", "POST", f"{B}/v1/tts", expect=500,
-          json={"text": "This should fail.", "speaker": "not_a_real_speaker"})
+    print("\n=== mode: vocalist_clone  (voice_id) ===")
+    if vocalists:
+        vid = vocalists[0]
+        check("vocalist", "POST", SPEAK,
+              json={"text": "This line is sung by a voice from the library.",
+                    "voice_id": vid, "language": "english"})
+        check("vocalist_batch", "POST", SPEAK,
+              json={"text": ["First vocalist line.", "Second vocalist line."],
+                    "voice_id": vid, "language": "english"})
+        check("vocalist_wav_bytes", "POST", SPEAK,
+              json={"text": "Vocalist voice as raw wav.", "voice_id": vid,
+                    "language": "english", "response_format": "wav"})
+        check("vocalist_instruct_warns", "POST", SPEAK,
+              json={"text": "Instruct should be ignored here.", "voice_id": vid,
+                    "instruct": "Very angry.", "language": "english"})
+    else:
+        print("  [SKIP] no vocalist voices installed - run tools/make_sample_vocalists.py")
+    check("vocalist_unknown", "POST", SPEAK, expect=404,
+          json={"text": "Should fail.", "voice_id": "definitely_not_a_voice"})
 
-    print("\n=== /v1/transcribe ===")
-    tr = check("transcribe_url", "POST", f"{B}/v1/transcribe", json={"audio": ref_url})
-    if tr:
-        print(f"         full transcript: {tr['text'][:100]}")
-
-    print("\n=== /v1/tts/clone  -  ref_text auto-generated ===")
-    check("clone_auto_reftext", "POST", f"{B}/v1/tts/clone",
+    print("\n=== mode: voice_clone  (audio) ===")
+    check("clone_url_auto_reftext", "POST", SPEAK,
           json={"text": "This sentence is spoken in a cloned voice.",
-                "language": "english", "ref_audio": ref_url})
-    check("clone_given_reftext", "POST", f"{B}/v1/tts/clone",
+                "audio": ref_url, "language": "english"})
+    check("clone_url_given_reftext", "POST", SPEAK,
           json={"text": "This one supplies the transcript explicitly.",
-                "language": "english", "ref_audio": ref_url, "ref_text": ref_text})
-    check("clone_batch", "POST", f"{B}/v1/tts/clone",
+                "audio": ref_url, "ref_text": ref_text, "language": "english"})
+    check("clone_batch", "POST", SPEAK,
           json={"text": ["First cloned line.", "Second cloned line."],
-                "language": "english", "ref_audio": ref_url})
-    check("clone_wav_bytes", "POST", f"{B}/v1/tts/clone",
+                "audio": ref_url, "ref_text": ref_text, "language": "english"})
+    check("clone_wav_bytes", "POST", SPEAK,
           json={"text": "Raw wav plus the transcript in a header.",
-                "language": "english", "ref_audio": ref_url, "response_format": "wav"})
+                "audio": ref_url, "ref_text": ref_text,
+                "language": "english", "response_format": "wav"})
 
-    sample = os.path.join(OUT_DIR, "tts_speaker.wav")
+    sample = os.path.join(OUT_DIR, "builtin.wav")
+    sample_text = "Hello, this is the Qwen3 text to speech engine speaking."
     if os.path.isfile(sample):
         with open(sample, "rb") as f:
             raw = f.read()
-        check("clone_upload_auto", "POST", f"{B}/v1/tts/clone/upload",
-              files={"ref_audio": ("ref.wav", raw, "audio/wav")},
-              data={"text": "Cloned from an uploaded file, transcript auto-generated.",
-                    "language": "english"})
+        check("clone_upload", "POST", SPEAK,
+              files={"audio": ("ref.wav", raw, "audio/wav")},
+              data={"text": "Cloned from a multipart upload.",
+                    "ref_text": sample_text, "language": "english"})
+        check("clone_upload_auto_reftext", "POST", SPEAK,
+              files={"audio": ("ref.wav", raw, "audio/wav")},
+              data={"text": "Uploaded with no transcript supplied.", "language": "english"})
+        check("clone_upload_wav_bytes", "POST", SPEAK,
+              files={"audio": ("ref.wav", raw, "audio/wav")},
+              data={"text": "Upload returning raw wav.", "ref_text": sample_text,
+                    "language": "english", "response_format": "wav"})
         b64 = base64.b64encode(raw).decode("ascii")
-        check("clone_raw_base64", "POST", f"{B}/v1/tts/clone",
-              json={"text": "Cloned from raw base64 audio.", "language": "english",
-                    "ref_audio": b64})
-        check("transcribe_upload", "POST", f"{B}/v1/transcribe/upload",
-              files={"audio": ("ref.wav", raw, "audio/wav")})
+        check("clone_raw_base64", "POST", SPEAK,
+              json={"text": "Cloned from raw base64 audio.", "audio": b64,
+                    "ref_text": sample_text, "language": "english"})
+        check("clone_data_uri", "POST", SPEAK,
+              json={"text": "Cloned from a data URI.",
+                    "audio": "data:audio/wav;base64," + b64,
+                    "ref_text": sample_text, "language": "english"})
 
-    print("\n" + "=" * 72)
-    passed = sum(1 for _, s, _, _ in results if s == "PASS")
-    for name, status, elapsed, note in results:
+    print("\n=== validation ===")
+    check("err_missing_text", "POST", SPEAK, expect=422,
+          json={"instruct": "Text is mandatory so this must fail."})
+    check("err_no_voice_no_instruct", "POST", SPEAK, expect=422,
+          json={"text": "Neither a voice source nor instruct, so this must fail."})
+    check("err_two_voice_sources", "POST", SPEAK, expect=422,
+          json={"text": "Two voice sources must be rejected.",
+                "speaker": "ryan", "audio": ref_url})
+    check("err_three_voice_sources", "POST", SPEAK, expect=422,
+          json={"text": "Three is also wrong.", "speaker": "ryan",
+                "voice_id": "aria_soul", "audio": ref_url})
+    check("err_bad_speaker", "POST", SPEAK, expect=500,
+          json={"text": "Unknown speaker.", "speaker": "not_a_real_speaker"})
+    check("err_wav_batch", "POST", SPEAK, expect=400,
+          json={"text": ["one", "two"], "speaker": "ryan", "response_format": "wav"})
+
+    print("\n" + "=" * 74)
+    passed = sum(1 for _, s, _ in results if s == "PASS")
+    for name, status, note in results:
         if status != "PASS":
             print(f"  {status:5}  {name}: {note}")
     print(f"  {passed}/{len(results)} passed   audio written to {OUT_DIR}")
-    print("=" * 72)
+    print("=" * 74)
     return 0 if passed == len(results) else 1
 
 
