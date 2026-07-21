@@ -338,7 +338,8 @@ cd VocalLoop---Qwen3TTS
 py -3.12 -m venv venv
 .\venv\Scripts\python.exe -m pip install -U pip
 .\venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-.\venv\Scripts\python.exe -m pip install -U qwen-tts fastapi "uvicorn[standard]" python-multipart requests
+.\venv\Scripts\python.exe -m pip install -e .\Qwen3-TTS
+.\venv\Scripts\python.exe -m pip install fastapi "uvicorn[standard]" python-multipart requests
 
 # Model weights are not in this repo - see DEPLOY_RUNPOD.md section 3 for the
 # `hf download` commands. They go in ./models/ (~14.2 GB).

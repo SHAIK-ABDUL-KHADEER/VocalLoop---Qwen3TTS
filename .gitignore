@@ -1,16 +1,20 @@
-# Model weights - ~14 GB, far over GitHub's limits. Downloaded by DEPLOY_RUNPOD.md step 4.
-models/
+# Downloaded model weights - ~14 GB, far over GitHub's limits.
+# Fetched by the `hf download` commands in DEPLOY_RUNPOD.md section 3.
+#
+# Leading slash matters: a bare `models/` would also match the vendored library's
+# own Qwen3-TTS/qwen_tts/core/models/ and silently drop its source files.
+/models/
 
 # Virtual environment - recreate with the steps in DEPLOY_RUNPOD.md
-venv/
-.venv/
+/venv/
+/.venv/
 
-# Upstream Qwen3-TTS is its own git repo; clone it separately rather than nesting it
-Qwen3-TTS/
+# Qwen3-TTS/ is vendored on purpose - see Qwen3-TTS/VENDORED.md. Its build
+# artefacts are excluded by the __pycache__/ and *.egg-info/ rules below.
 
-# Generated audio and registered voices
-test_output/
-saved_voices/
+# Generated audio
+/test_output/
+/saved_voices/
 *.wav
 
 # ...but the vocalist library IS part of the project. Sample clips are small and

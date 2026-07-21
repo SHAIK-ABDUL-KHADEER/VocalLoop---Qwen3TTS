@@ -71,8 +71,14 @@ git clone https://github.com/SHAIK-ABDUL-KHADEER/VocalLoop---Qwen3TTS.git
 cd VocalLoop---Qwen3TTS
 python -m venv venv && source venv/bin/activate     # Windows: .\venv\Scripts\activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install -U qwen-tts fastapi "uvicorn[standard]" python-multipart requests
+pip install -e ./Qwen3-TTS
+pip install fastapi "uvicorn[standard]" python-multipart requests
 ```
+
+The Qwen3-TTS library is **vendored** in [Qwen3-TTS/](Qwen3-TTS/), so one clone is all you
+need. It is an unmodified upstream checkout — see
+[Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md) for the exact commit and how to update it.
+(`pip install -U qwen-tts` from PyPI is equivalent at this version.)
 
 Model weights (~14.2 GB) are **not** in this repo — download them with the `hf download`
 commands in [DEPLOY_RUNPOD.md](DEPLOY_RUNPOD.md). They go in `./models/`.
@@ -81,15 +87,15 @@ Then:
 
 ```bash
 python server/app.py          # http://127.0.0.1:9000
-python test_endpoints.py      # full suite
+python test_endpoints.py      # full suite, 28 checks
 ```
 
 Open <http://127.0.0.1:9000/demo> for a working UI that shows which mode each request will
 use as you fill the form.
 
-`qwen-tts` installs from PyPI — this project does not patch the upstream library, so you do
-not need to clone `QwenLM/Qwen3-TTS`. The workarounds for its rough edges live in
-[server/app.py](server/app.py).
+This project never patches the vendored library — every workaround for its rough edges lives
+in [server/app.py](server/app.py), so the folder can be swapped for a newer upstream
+checkout without losing anything.
 
 ## Deploying
 
@@ -103,6 +109,7 @@ No code edits are required to deploy; everything is environment-driven.
 | Path | What |
 |---|---|
 | [server/app.py](server/app.py) | The API |
+| [Qwen3-TTS/](Qwen3-TTS/) | Vendored upstream library — see [VENDORED.md](Qwen3-TTS/VENDORED.md) |
 | [server/static/demo.html](server/static/demo.html) | Demo UI served at `/demo` |
 | [voices/](voices/) | Vocalist voice library |
 | [tools/make_sample_vocalists.py](tools/make_sample_vocalists.py) | Regenerates the placeholder vocalist clips |

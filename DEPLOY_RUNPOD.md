@@ -31,7 +31,8 @@ Once running, open a **Web Terminal** or connect over SSH.
 
 ## 2. Install
 
-Clone **this** repo — it holds the API server, which is not part of upstream Qwen3-TTS:
+Clone **this** repo. It contains both the API server and a vendored copy of the Qwen3-TTS
+library in `Qwen3-TTS/`, so nothing else needs fetching:
 
 ```bash
 cd /workspace
@@ -54,14 +55,14 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 Then the TTS engine and the API's own dependencies:
 
 ```bash
-pip install -U qwen-tts
+pip install -e ./Qwen3-TTS
 pip install fastapi "uvicorn[standard]" python-multipart requests
 ```
 
-> `qwen-tts` comes straight from PyPI — this project does **not** patch the upstream library,
-> so there is no need to clone `QwenLM/Qwen3-TTS`. Every workaround for its quirks lives in
-> [server/app.py](server/app.py). Clone upstream only if you want the Gradio demo or the
-> fine-tuning scripts.
+> `pip install -e ./Qwen3-TTS` installs the vendored library, which also pulls in
+> transformers, accelerate, librosa, soundfile and onnxruntime. It is byte-identical to
+> `qwen-tts` 0.1.1 on PyPI — `pip install -U qwen-tts` is an equivalent substitute. See
+> [Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md) for provenance and how to update it.
 
 **FlashAttention 2** — worth it on Linux, and the server picks it up automatically:
 
@@ -153,32 +154,47 @@ If `device` says `cpu` or `asr model ... on cpu`, stop and fix it — you are no
 
 ### Keep it running after you disconnect
 
+A RunPod pod is a container, and **there is no systemd inside it** — `systemctl` fails with
+"System has not been booted with systemd as init system". Use one of these instead.
+
+**tmux**, for interactive work:
+
 ```bash
 tmux new -s tts
-# start the server, then detach with Ctrl-B then D
+# start the server as above, then detach with Ctrl-B then D
+# come back later with: tmux attach -t tts
 ```
 
-Or run it as a service so it survives a pod restart:
+**A supervised background process**, to survive disconnects and restart on crash. Save this
+as `/workspace/vocalloop/run.sh`:
 
 ```bash
-cat >/etc/systemd/system/qwen-tts.service <<'EOF'
-[Unit]
-Description=Qwen3-TTS API
-After=network.target
+#!/usr/bin/env bash
+cd /workspace/vocalloop
+source venv/bin/activate
+set -a && source .env && set +a
+while true; do
+  python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
+  echo "server exited ($?), restarting in 5s" >&2
+  sleep 5
+done
+```
 
-[Service]
-WorkingDirectory=/workspace/vocalloop
-EnvironmentFile=/workspace/vocalloop/.env
-ExecStart=/workspace/vocalloop/venv/bin/python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
-Restart=always
-RestartSec=5
+```bash
+chmod +x /workspace/vocalloop/run.sh
+nohup /workspace/vocalloop/run.sh > /workspace/vocalloop/server.log 2>&1 &
+tail -f /workspace/vocalloop/server.log
+```
 
-[Install]
-WantedBy=multi-user.target
-EOF
+The restart loop matters: a CUDA OOM can kill the process outright with no traceback, and
+without it the pod keeps billing while serving nothing.
 
-systemctl daemon-reload && systemctl enable --now qwen-tts
-journalctl -u qwen-tts -f
+**Start it automatically when the pod boots.** Nothing under `/workspace` runs on its own —
+put the command in the pod's *Container Start Command* (Edit Pod → Docker Command), or
+append it to the template's startup script:
+
+```bash
+bash -c "/workspace/vocalloop/run.sh"
 ```
 
 ---
@@ -194,17 +210,21 @@ curl https://<POD_ID>-9000.proxy.runpod.net/health
 `/health` stays open so RunPod's probes work. Confirm `config.device` is `cuda:0` and
 `config.asr_device` is `cuda:0`.
 
-Run the full suite against the deployed server (needs `requests` locally):
+Run the full suite against the deployed server (needs `requests` installed wherever you run
+it from):
 
 ```bash
-python test_endpoints.py --base-url https://<POD_ID>-9000.proxy.runpod.net
+python test_endpoints.py \
+  --base-url https://<POD_ID>-9000.proxy.runpod.net \
+  --api-key "$QWEN_TTS_API_KEY"
 ```
 
-> The suite does **not** send an API key. Either run it before setting `QWEN_TTS_API_KEY`,
-> or add the header to `check()` in [test_endpoints.py](test_endpoints.py). Alternatively run it
-> from inside the pod against `http://127.0.0.1:9000`.
+`--api-key` also reads the `QWEN_TTS_API_KEY` environment variable, so inside the pod
+`python test_endpoints.py` picks it up from `.env` with no extra flags. All 28 checks should
+pass. Expect roughly 5–10 minutes over the public proxy.
 
-A first-call warm-up of ~10–20 s per model is normal; after that all three stay resident.
+A first-call warm-up of ~10–20 s per model is normal. After that all three TTS models and
+Whisper stay resident and nothing reloads.
 
 ---
 
@@ -305,3 +325,11 @@ the volume means transcripts stay cached across pod restarts. See
 | CORS errors in the browser | Set `QWEN_TTS_CORS_ORIGINS` to your exact origin, scheme included. |
 | Server dies with no traceback | Almost always OOM. Check `nvidia-smi`; make sure only one server process is running. |
 | Port not reachable | Port `9000` must be in the pod's exposed HTTP ports, and the server bound to `0.0.0.0`, not `127.0.0.1`. |
+| `systemctl: command not found` / "not been booted with systemd" | Expected — a pod is a container. Use `run.sh` + `nohup`, or tmux. See section 5. |
+| `ModuleNotFoundError: qwen_tts` | The venv is not active, or `pip install -e ./Qwen3-TTS` was skipped. |
+| `404 Unknown voice_id` | The clip is not in `QWEN_TTS_VOICE_DIR`. The `voice_id` is the filename without its extension; the error lists what is available. |
+| `502 Could not fetch reference audio` | The server could not download the URL you passed as `audio`. Check the pod has outbound access, or upload the clip instead. |
+| Everything works, then dies after a few requests | Repeated model eviction on a small GPU. Not applicable on an A100 unless `QWEN_TTS_MAX_RESIDENT` was forced to `1`; drop the override. |
+
+If you get stuck, `GET /health` answers most questions at once — it reports the device, ASR
+placement, which models are loaded, which are downloaded, and whether auth is on.
