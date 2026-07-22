@@ -41,6 +41,7 @@ Config via environment variables (all optional):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import gc
 import importlib.util
@@ -52,8 +53,10 @@ import secrets
 import threading
 import time
 import urllib.request
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -114,6 +117,27 @@ API_KEY = os.environ.get("QWEN_TTS_API_KEY") or None
 CORS_ORIGINS = [
     o.strip() for o in os.environ.get("QWEN_TTS_CORS_ORIGINS", "*").split(",") if o.strip()
 ]
+
+# --- batching -------------------------------------------------------------- #
+# Decoding one step reads the whole 3.4 GB of weights out of VRAM whether it is
+# producing for one caller or twenty, so generating 20 clips together costs barely
+# more than generating one. Requests are therefore queued and merged into single
+# model calls. Measured on an 8 GB laptop, batch 16 did ~6.8x the work of batch 1
+# and was still scaling, so the ceiling here is well above the default.
+MAX_BATCH_ITEMS = int(os.environ.get("QWEN_TTS_MAX_BATCH") or (16 if _TOTAL_VRAM_GB >= 24 else 4))
+# How long to hold the first request waiting for company. Only felt when idle -
+# under load the queue is already full when a batch finishes, so batches form for
+# free. Keep it far below generation time (seconds) or every caller pays for it.
+BATCH_WINDOW_S = float(os.environ.get("QWEN_TTS_BATCH_WINDOW_MS") or 40) / 1000.0
+
+# --- guardrails ------------------------------------------------------------ #
+# One caller pasting a novel would otherwise hold the GPU for minutes and stall
+# everyone else, with no way to shed load.
+MAX_ITEMS_PER_REQUEST = int(os.environ.get("QWEN_TTS_MAX_ITEMS") or 32)
+MAX_CHARS_PER_ITEM = int(os.environ.get("QWEN_TTS_MAX_CHARS") or 3000)
+MAX_QUEUE_ITEMS = int(os.environ.get("QWEN_TTS_MAX_QUEUE") or 128)
+REQUEST_TIMEOUT_S = float(os.environ.get("QWEN_TTS_TIMEOUT") or 600)
+WARMUP = os.environ.get("QWEN_TTS_WARMUP", "").lower() in ("1", "true", "yes")
 
 MODEL_PATHS = {
     "voice_design": os.path.join(MODEL_DIR, "Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
@@ -311,7 +335,8 @@ gpu_lock = threading.Lock()
 # every un-transcribed clone needs it, so evicting a TTS model to make room and
 # then evicting it again would thrash.
 _asr = None
-_asr_lock = threading.Lock()
+_asr_lock = threading.Lock()          # guards loading
+_asr_infer_lock = threading.Lock()    # guards inference (one Whisper call at a time)
 
 
 def get_asr():
@@ -436,12 +461,11 @@ def load_audio_np(ref: str) -> Tuple[np.ndarray, int]:
 def transcribe_wav(wav: np.ndarray, sr: int) -> str:
     """Speech-to-text for an already-loaded waveform. 400 if nothing intelligible."""
     asr = get_asr()
-    if ASR_DEVICE == "cpu":
-        # No GPU involved, so don't block generation behind it.
+    # Its own lock, deliberately not gpu_lock: Whisper is a different model, and
+    # PyTorch is happy running it alongside a TTS batch. Sharing gpu_lock would
+    # stall transcription behind every generation (and vice versa) for no reason.
+    with _asr_infer_lock:
         out = asr({"array": wav, "sampling_rate": sr})
-    else:
-        with gpu_lock:
-            out = asr({"array": wav, "sampling_rate": sr})
     text = (out.get("text") or "").strip()
     if not text:
         raise HTTPException(
@@ -533,6 +557,117 @@ class SpeakRequest(BaseModel):
 # Form fields that are not part of the model but carry the uploaded file.
 _FILE_FIELDS = ("audio", "file", "ref_audio")
 
+# The endpoint reads the raw Request so it can accept JSON *and* multipart on one
+# path, which means FastAPI cannot infer a body schema. Supply it by hand, with a
+# runnable example per mode so "Try it out" in /docs works without typing.
+DEMO_REF_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+
+SPEAK_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": SpeakRequest.model_json_schema(),
+                "examples": {
+                    "described_voice": {
+                        "summary": "1. Describe a voice (no voice source)",
+                        "description": "No speaker, no clip - the voice is invented from "
+                                       "`instruct`, which is required in this mode.",
+                        "value": {
+                            "text": "Welcome, traveller. You have journeyed far.",
+                            "instruct": "An elderly wizard, deep gravelly voice, slow and wise.",
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                    "built_in_voice": {
+                        "summary": "2. Built-in voice",
+                        "description": "One of the 9 shipped voices. See GET /v1/voices.",
+                        "value": {
+                            "text": "Hello, this is the Qwen3 text to speech engine speaking.",
+                            "speaker": "ryan",
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                    "built_in_voice_restyled": {
+                        "summary": "3. Built-in voice + style instruction",
+                        "description": "`instruct` is optional here and restyles the speaker.",
+                        "value": {
+                            "text": "I cannot believe you did that. This is unacceptable.",
+                            "speaker": "vivian",
+                            "instruct": "Speak in a furious, sharp tone.",
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                    "vocalist_clone": {
+                        "summary": "4. Vocalist voice from the library",
+                        "description": "Clones a curated clip. Ids come from "
+                                       "GET /v1/voices -> vocalist.",
+                        "value": {
+                            "text": "This line is spoken by a voice from the library.",
+                            "voice_id": "aria_soul",
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                    "voice_clone_url": {
+                        "summary": "5. Clone a clip by URL",
+                        "description": "`ref_text` omitted, so the clip is transcribed "
+                                       "automatically. Add it when you know the exact words.",
+                        "value": {
+                            "text": "This sentence is spoken in a cloned voice.",
+                            "audio": DEMO_REF_URL,
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                    "batch": {
+                        "summary": "6. Batch, one voice per line",
+                        "description": "`text` as a list. Other fields take one value or a "
+                                       "list of matching length. JSON only.",
+                        "value": {
+                            "text": ["The first sentence is spoken here.",
+                                     "And the second follows after it."],
+                            "speaker": ["ryan", "aiden"],
+                            "language": "english",
+                        },
+                    },
+                    "raw_wav_response": {
+                        "summary": "7. Return raw WAV instead of JSON",
+                        "description": "Returns audio/wav bytes with the mode in an X-Mode "
+                                       "header. Single item only.",
+                        "value": {
+                            "text": "This response is raw wav bytes, not JSON.",
+                            "speaker": "aiden",
+                            "language": "english",
+                            "response_format": "wav",
+                        },
+                    },
+                },
+            },
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["text", "audio"],
+                    "properties": {
+                        "text": {"type": "string", "title": "Text to speak",
+                                 "example": "Cloned from an uploaded file."},
+                        "audio": {"type": "string", "format": "binary",
+                                  "title": "Reference clip to clone"},
+                        "ref_text": {"type": "string", "title": "Transcript (optional)",
+                                     "description": "Omit and the clip is transcribed for you."},
+                        "language": {"type": "string", "default": "auto", "enum": LANGUAGES},
+                        "response_format": {"type": "string", "default": "json",
+                                            "enum": ["json", "wav"]},
+                    },
+                },
+            },
+        },
+    },
+}
+
 
 async def parse_speak_request(request: Request) -> SpeakRequest:
     """Build a SpeakRequest from either a JSON body or multipart form data.
@@ -602,12 +737,44 @@ async def lifespan(app: FastAPI):
     print(f"[startup] asr model    : {ASR_MODEL} on {ASR_DEVICE}")
     print(f"[startup] auth         : {'X-API-Key required' if API_KEY else 'OPEN (no api key)'}")
     print(f"[startup] cors origins : {CORS_ORIGINS}")
+    print(f"[startup] batching     : up to {MAX_BATCH_ITEMS} items, "
+          f"{BATCH_WINDOW_S * 1000:.0f}ms window")
+    print(f"[startup] limits       : {MAX_ITEMS_PER_REQUEST} items/req, "
+          f"{MAX_CHARS_PER_ITEM} chars/item, queue {MAX_QUEUE_ITEMS}, "
+          f"timeout {REQUEST_TIMEOUT_S:.0f}s")
     if DEVICE == "cpu":
         print("[startup] WARNING no CUDA device found - generation will be extremely slow.")
     missing = [k for k, p in MODEL_PATHS.items() if not os.path.isdir(p)]
     if missing:
         print(f"[startup] WARNING missing models: {missing}")
-    yield
+    if MAX_RESIDENT < len([k for k in MODEL_PATHS if os.path.isdir(MODEL_PATHS[k])]):
+        print(f"[startup] NOTE max_resident={MAX_RESIDENT} is below the number of models, "
+              "so switching modes will evict and reload (10-30s). Fine on a small GPU, "
+              "but set QWEN_TTS_MAX_RESIDENT=3 where there is VRAM for it.")
+
+    worker = asyncio.create_task(batch_worker())
+
+    if WARMUP:
+        # Load every model up front so the first real caller does not eat the
+        # 10-30s load. Only sane when they all stay resident.
+        def _load(kind: str):
+            with gpu_lock:               # registry.get requires it
+                registry.get(kind)
+
+        for kind in MODEL_PATHS:
+            if os.path.isdir(MODEL_PATHS[kind]):
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        gpu_executor, _load, kind
+                    )
+                except Exception as e:
+                    print(f"[startup] warmup of '{kind}' failed: {e}")
+        print(f"[startup] warmed up  : {registry.resident()}")
+
+    try:
+        yield
+    finally:
+        worker.cancel()
 
 
 app = FastAPI(
@@ -627,10 +794,225 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Batching engine
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Job:
+    """One in-flight /v1/speak request, waiting for the batch worker."""
+
+    mode: str
+    model_kind: str
+    gen_key: Tuple            # requests with different sampling knobs cannot merge
+    gen_kwargs: Dict[str, Any]
+    texts: List[str]
+    speakers: List[Optional[str]]
+    instructs: List[str]
+    languages: List[str]
+    ref_clip: Optional[Tuple[np.ndarray, int]]
+    ref_text: Optional[str]
+    info: Dict[str, Any]
+    warnings: List[str]
+    future: "asyncio.Future"
+    queued_at: float
+
+    @property
+    def n(self) -> int:
+        return len(self.texts)
+
+
+class Metrics:
+    """Just enough to answer 'is the queue backing up?' from /health."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waits = deque(maxlen=200)       # queue wait, seconds
+        self.batch_sizes = deque(maxlen=200)
+        self.completed = 0
+        self.failed = 0
+        self.rejected = 0
+        self.generating = 0
+
+    def record(self, wait: float) -> None:
+        with self.lock:
+            self.waits.append(wait)
+
+    def snapshot(self, queued_items: int) -> Dict[str, Any]:
+        with self.lock:
+            waits = sorted(self.waits)
+            sizes = list(self.batch_sizes)
+
+        def pct(p):
+            if not waits:
+                return 0.0
+            return round(waits[min(len(waits) - 1, int(len(waits) * p))], 2)
+
+        return {
+            "generating_items": self.generating,
+            "queued_items": queued_items,
+            "queue_wait_p50_seconds": pct(0.50),
+            "queue_wait_p95_seconds": pct(0.95),
+            "avg_batch_size": round(sum(sizes) / len(sizes), 2) if sizes else 0.0,
+            "max_batch_size_seen": max(sizes) if sizes else 0,
+            "completed": self.completed,
+            "failed": self.failed,
+            "rejected_overload": self.rejected,
+        }
+
+
+metrics = Metrics()
+job_queue: "asyncio.Queue[Job]" = asyncio.Queue()
+_queued_items = 0                 # items (not requests) currently waiting
+_queued_lock = threading.Lock()
+
+# Generation gets its own single thread rather than the default executor. Reference
+# downloads and transcriptions also run in threads, and if they filled the shared
+# pool the batch worker could be left with no thread to run on.
+gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-gpu")
+
+
+def _adjust_queued(delta: int) -> int:
+    global _queued_items
+    with _queued_lock:
+        _queued_items += delta
+        return _queued_items
+
+
+def run_group(jobs: List[Job]) -> List[Tuple[Job, Any]]:
+    """Generate for one compatible group in a single model call. Blocking - runs
+    in a worker thread.
+
+    Compatible means: same model, same sampling kwargs. Every job's items are
+    flattened into one list, generated together, then sliced back apart.
+    """
+    texts, speakers, instructs, languages, ref_audios, ref_texts = [], [], [], [], [], []
+    for j in jobs:
+        texts += j.texts
+        speakers += j.speakers
+        instructs += j.instructs
+        languages += j.languages
+        if j.model_kind == "base":
+            ref_audios += [j.ref_clip] * j.n
+            ref_texts += [j.ref_text] * j.n
+
+    kind = jobs[0].model_kind
+    gen = jobs[0].gen_kwargs
+
+    with gpu_lock:
+        metrics.generating = len(texts)
+        t0 = time.time()
+        try:
+            model = registry.get(kind)
+            if kind == "custom_voice":
+                wavs, sr = model.generate_custom_voice(
+                    text=texts, speaker=speakers, language=languages,
+                    instruct=instructs, **gen,
+                )
+            elif kind == "voice_design":
+                wavs, sr = model.generate_voice_design(
+                    text=texts, instruct=instructs, language=languages, **gen,
+                )
+            else:
+                wavs, sr = model.generate_voice_clone(
+                    text=texts, language=languages,
+                    ref_audio=ref_audios, ref_text=ref_texts, **gen,
+                )
+        finally:
+            metrics.generating = 0
+        elapsed = time.time() - t0
+
+    with metrics.lock:
+        metrics.batch_sizes.append(len(texts))
+
+    out, cursor = [], 0
+    for j in jobs:
+        out.append((j, (wavs[cursor:cursor + j.n], sr, elapsed)))
+        cursor += j.n
+    return out
+
+
+def run_group_isolated(jobs: List[Job]) -> List[Tuple[Job, Any]]:
+    """Run a group, and if it blows up, retry each job alone.
+
+    One malformed request must not fail everyone batched alongside it, so the
+    fallback narrows the blast radius to the job that actually breaks.
+    """
+    try:
+        return run_group(jobs)
+    except Exception as e:
+        if len(jobs) == 1:
+            return [(jobs[0], e)]
+        print(f"[batch] group of {len(jobs)} failed ({e}); retrying individually")
+        out = []
+        for j in jobs:
+            try:
+                out += run_group([j])
+            except Exception as inner:
+                out.append((j, inner))
+        return out
+
+
+def _group_key(job: Job) -> Tuple:
+    return (job.model_kind, job.gen_key)
+
+
+async def batch_worker() -> None:
+    """Collect queued jobs, merge compatible ones, and run them on the GPU."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            first = await job_queue.get()
+            batch, items = [first], first.n
+            deadline = loop.time() + BATCH_WINDOW_S
+
+            # Fill the window. Under load the queue is already populated, so this
+            # returns immediately and batches form without anyone waiting.
+            while items < MAX_BATCH_ITEMS:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    nxt = await asyncio.wait_for(job_queue.get(), remaining)
+                except asyncio.TimeoutError:
+                    break
+                batch.append(nxt)
+                items += nxt.n
+
+            groups: Dict[Tuple, List[Job]] = defaultdict(list)
+            for j in batch:
+                groups[_group_key(j)].append(j)
+
+            # Run whichever model is already resident first. With MAX_RESIDENT
+            # below the number of models, this avoids an eviction + 10-30s reload
+            # in the middle of serving.
+            resident = set(registry.resident())
+            for key in sorted(groups, key=lambda k: k[0] not in resident):
+                jobs = groups[key]
+                for j in jobs:
+                    metrics.record(time.time() - j.queued_at)
+                _adjust_queued(-sum(j.n for j in jobs))
+                results = await loop.run_in_executor(gpu_executor, run_group_isolated, jobs)
+                for job, result in results:
+                    if job.future.done():
+                        continue          # client disconnected
+                    if isinstance(result, Exception):
+                        metrics.failed += 1
+                        job.future.set_exception(result)
+                    else:
+                        metrics.completed += 1
+                        job.future.set_result(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                      # the worker must never die
+            print(f"[batch] worker error: {e}")
+
+
 # ------------------------------ the endpoint ------------------------------- #
 
 
-@app.post("/v1/speak", tags=["speech"])
+@app.post("/v1/speak", tags=["speech"], openapi_extra=SPEAK_OPENAPI)
 async def speak(request: Request):
     """Generate speech. The request decides which model runs.
 
@@ -641,8 +1023,10 @@ async def speak(request: Request):
     | `voice_id` | `vocalist_clone` | clones a curated vocalist clip |
     | `audio` | `voice_clone` | clones the supplied clip (JSON string or multipart file) |
 
-    Accepts `application/json` or `multipart/form-data`.
+    Accepts `application/json` or `multipart/form-data`. Requests are batched with
+    others arriving at the same time, so concurrent callers share one model pass.
     """
+    loop = asyncio.get_running_loop()
     req = await parse_speak_request(request)
     texts = as_list(req.text)
     n = len(texts)
@@ -650,7 +1034,29 @@ async def speak(request: Request):
     warnings: List[str] = []
     info: Dict[str, Any] = {}
 
-    # --- resolve the reference clip for the two cloning modes -------------- #
+    # --- guardrails --------------------------------------------------------- #
+    if n > MAX_ITEMS_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{n} items in one request exceeds the limit of {MAX_ITEMS_PER_REQUEST}. "
+                   "Split it into several requests - that also lets other callers interleave.",
+        )
+    for t in texts:
+        if len(t) > MAX_CHARS_PER_ITEM:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A text item is {len(t)} characters, over the {MAX_CHARS_PER_ITEM} limit.",
+            )
+
+    if _queued_items + n > MAX_QUEUE_ITEMS:
+        metrics.rejected += 1
+        raise HTTPException(
+            status_code=503,
+            detail="Server is at capacity, please retry shortly.",
+            headers={"Retry-After": "5"},
+        )
+
+    # --- resolve the reference clip for the two cloning modes --------------- #
     ref_clip: Optional[Tuple[np.ndarray, int]] = None
     ref_text: Optional[str] = req.ref_text.strip() if req.ref_text else None
 
@@ -667,11 +1073,12 @@ async def speak(request: Request):
                 "`instruct` is not supported when cloning a voice and was ignored."
             )
 
-        # Resolved once here and handed to both steps below.
-        ref_clip = load_audio_np(source)
+        # Fetching and transcribing happen off the event loop, and outside the
+        # GPU queue, so a slow download never blocks generation for others.
+        ref_clip = await loop.run_in_executor(None, load_audio_np, source)
 
         if not ref_text:
-            ref_text = transcribe_wav(*ref_clip)
+            ref_text = await loop.run_in_executor(None, transcribe_wav, *ref_clip)
             info["ref_text_auto_generated"] = True
             if mode == "vocalist_clone":
                 cache_vocalist_transcript(req.voice_id, ref_text)
@@ -679,39 +1086,42 @@ async def speak(request: Request):
             info["ref_text_auto_generated"] = False
         info["ref_text"] = ref_text
 
-    # --- generate ----------------------------------------------------------- #
-    languages = broadcast(req.language or "auto", n, "language")
+    # --- queue it ------------------------------------------------------------ #
     gen = req.gen_kwargs()
+    job = Job(
+        mode=mode,
+        model_kind={"built_in_voice": "custom_voice",
+                    "described_voice": "voice_design"}.get(mode, "base"),
+        gen_key=tuple(sorted(gen.items())),
+        gen_kwargs=gen,
+        texts=texts,
+        speakers=broadcast(req.speaker, n, "speaker"),
+        # "" rather than None: the library treats an empty instruction as none,
+        # and a list mixing None with strings is not safe to batch.
+        instructs=[i or "" for i in broadcast(req.instruct, n, "instruct")],
+        languages=broadcast(req.language or "auto", n, "language"),
+        ref_clip=ref_clip,
+        ref_text=ref_text,
+        info=info,
+        warnings=warnings,
+        future=loop.create_future(),
+        queued_at=time.time(),
+    )
 
-    with gpu_lock:
-        t0 = time.time()
-        if mode == "built_in_voice":
-            model = registry.get("custom_voice")
-            wavs, sr = model.generate_custom_voice(
-                text=texts,
-                speaker=broadcast(req.speaker, n, "speaker"),
-                language=languages,
-                instruct=broadcast(req.instruct, n, "instruct") if req.instruct else None,
-                **gen,
-            )
-        elif mode == "described_voice":
-            model = registry.get("voice_design")
-            wavs, sr = model.generate_voice_design(
-                text=texts,
-                instruct=broadcast(req.instruct, n, "instruct"),
-                language=languages,
-                **gen,
-            )
-        else:
-            model = registry.get("base")
-            wavs, sr = model.generate_voice_clone(
-                text=texts,
-                language=languages,
-                ref_audio=ref_clip,   # (waveform, sample_rate), already resolved
-                ref_text=ref_text,
-                **gen,
-            )
-        elapsed = time.time() - t0
+    _adjust_queued(n)
+    await job_queue.put(job)
+    try:
+        wavs, sr, elapsed = await asyncio.wait_for(job.future, REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        job.future.cancel()
+        raise HTTPException(
+            status_code=504,
+            detail=f"Generation exceeded {REQUEST_TIMEOUT_S:.0f}s. Try shorter text.",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}") from e
 
     # --- respond ------------------------------------------------------------ #
     if req.response_format == "wav":
@@ -787,6 +1197,9 @@ def health():
         "resident_models": registry.resident(),
         "asr_loaded": _asr is not None,
         "vocalist_voices": len(list_vocalists()),
+        # Watch queued_items and queue_wait_p95_seconds. Consistently near zero
+        # means batching has nothing to merge and the GPU is keeping up.
+        "load": metrics.snapshot(_queued_items),
         # Auto-tuned at startup - check these to confirm you are on the GPU.
         "config": {
             "device": DEVICE,
@@ -794,6 +1207,11 @@ def health():
             "max_resident": MAX_RESIDENT,
             "attn_implementation": ATTN,
             "auth": "api_key" if API_KEY else "open",
+            "max_batch_items": MAX_BATCH_ITEMS,
+            "batch_window_ms": round(BATCH_WINDOW_S * 1000),
+            "max_items_per_request": MAX_ITEMS_PER_REQUEST,
+            "max_queue_items": MAX_QUEUE_ITEMS,
+            "request_timeout_seconds": REQUEST_TIMEOUT_S,
         },
         "models_downloaded": {k: os.path.isdir(p) for k, p in MODEL_PATHS.items()},
     }

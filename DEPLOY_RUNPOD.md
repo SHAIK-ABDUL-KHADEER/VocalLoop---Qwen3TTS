@@ -109,6 +109,13 @@ QWEN_TTS_API_KEY=<paste-a-long-random-string>
 
 # Only your site may call the API from a browser
 QWEN_TTS_CORS_ORIGINS=https://yoursite.com,https://www.yoursite.com
+
+# Batch up to 16 concurrent requests into one model pass. The default is already
+# 16 on a >=24 GB card; raise it if /health shows the queue backing up.
+QWEN_TTS_MAX_BATCH=16
+
+# Load all models at boot so the first real caller does not pay the 10-30s load.
+QWEN_TTS_WARMUP=1
 ```
 
 Everything else auto-detects. On an A100 80 GB you should see:
@@ -119,6 +126,7 @@ Everything else auto-detects. On an A100 80 GB you should see:
 | `max_resident` | `3` | ≥24 GB VRAM, so all three TTS models stay loaded |
 | `asr_device` | `cuda:0` | ≥16 GB VRAM, so Whisper runs on GPU (~10× faster) |
 | `attn_implementation` | `flash_attention_2` | if flash-attn installed, else `sdpa` |
+| `max_batch_items` | `16` | ≥24 GB VRAM, so concurrent requests merge 16 at a time |
 
 Total resident: **14.2 GB of 80 GB**. Nothing ever evicts or reloads.
 
@@ -148,6 +156,9 @@ Watch the startup lines — they print the resolved config:
 [startup] attn impl    : flash_attention_2
 [startup] asr model    : .../whisper-large-v3-turbo on cuda:0
 [startup] auth         : X-API-Key required
+[startup] batching     : up to 16 items, 40ms window
+[startup] limits       : 32 items/req, 3000 chars/item, queue 128, timeout 600s
+[startup] warmed up    : ['voice_design', 'custom_voice', 'base']
 ```
 
 If `device` says `cpu` or `asr model ... on cpu`, stop and fix it — you are not on the GPU.
@@ -267,18 +278,29 @@ See [ENDPOINTS.md](ENDPOINTS.md) for the full request/response reference.
 
 ## Operational notes
 
-**Concurrency.** The server serializes GPU work behind one lock — one generation at a time,
-the rest queue. To use more of the A100, run several workers, each a separate process with
-its own copy of the models (14.2 GB each, so 4–5 fit in 80 GB), behind nginx:
+**Concurrency — run ONE process.** The server batches concurrent requests into a single
+model pass, so one process uses the GPU far better than several competing ones. Measured on
+an 8 GB laptop: 4 concurrent requests took 14.5 s batched versus 58.3 s serial (**4×**), and
+8 simultaneous users were all served in 20.4 s at 1.40× real-time throughput. An A100 with
+`QWEN_TTS_MAX_BATCH=16` has considerably more headroom again.
 
-```bash
-python -m uvicorn server.app:app --host 0.0.0.0 --port 9001 &
-python -m uvicorn server.app:app --host 0.0.0.0 --port 9002 &
+Running several processes would be *worse*: each loads its own 14.2 GB (so only ~5 fit), and
+they would split the traffic into smaller batches while contending for the same GPU. One
+process with a big batch beats five processes with small ones.
+
+Do **not** use `uvicorn --workers N` either — every worker loads its own models with no
+shared queue, which is the same problem plus VRAM pressure.
+
+Scale by raising `QWEN_TTS_MAX_BATCH` first, and only then by adding a second GPU. Check
+`GET /health` → `load` to see whether you actually need to:
+
+```json
+"load": { "queued_items": 7, "queue_wait_p95_seconds": 8.4, "avg_batch_size": 5.3 }
 ```
 
-Do **not** use `uvicorn --workers N` — each worker would load its own models with no
-coordination, and they would race for VRAM. Separate ports plus a load balancer is
-predictable. Measure before scaling: run [bench.py](bench.py) on the pod first.
+`queued_items` near zero means you have spare capacity. A rising `queue_wait_p95_seconds` is
+the signal to scale. Run [bench.py](bench.py) once on the pod to record the ceiling, and
+[test_concurrency.py](test_concurrency.py) to feel what N simultaneous users experience.
 
 **Cost.** A pod bills while running, whether or not it is serving. Stop it when idle. If
 traffic is bursty, RunPod Serverless suits the workload better, but that route wants a

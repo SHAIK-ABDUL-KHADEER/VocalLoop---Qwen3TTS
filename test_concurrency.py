@@ -69,6 +69,19 @@ def main():
             print(f"    {label}: {note}")
     else:
         print(f"  all {len(jobs)} concurrent requests succeeded - no eviction race")
+
+    # Did the batcher actually merge anything? avg_batch_size stuck at 1.0 while
+    # requests genuinely overlapped means batching is not engaging.
+    try:
+        load = requests.get(f"{B}/health", timeout=30).json().get("load", {})
+        print(f"\n  avg batch size   : {load.get('avg_batch_size')}")
+        print(f"  max batch seen   : {load.get('max_batch_size_seen')}")
+        print(f"  queue wait p95   : {load.get('queue_wait_p95_seconds')}s")
+        print(f"  completed/failed : {load.get('completed')}/{load.get('failed')}")
+        if load.get("max_batch_size_seen", 0) <= 1 and args.workers > 1:
+            print("  NOTE batching never merged - check QWEN_TTS_MAX_BATCH > 1")
+    except Exception as e:
+        print(f"  (could not read /health: {e})")
     print("=" * 72)
     return 1 if failures else 0
 

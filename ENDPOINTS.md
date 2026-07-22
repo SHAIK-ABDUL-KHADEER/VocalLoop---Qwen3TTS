@@ -384,6 +384,13 @@ Every value auto-detects from the hardware; the environment variables are overri
 | `QWEN_TTS_API_KEY` | unset → open | Require this in `X-API-Key` |
 | `QWEN_TTS_CORS_ORIGINS` | `*` | Comma-separated allowed origins |
 | `QWEN_TTS_HOST` / `QWEN_TTS_PORT` | `127.0.0.1` / `9000` | Bind address |
+| `QWEN_TTS_MAX_BATCH` | `16` if ≥24 GB VRAM, else `4` | Items merged into one model pass |
+| `QWEN_TTS_BATCH_WINDOW_MS` | `40` | How long an idle request waits for company |
+| `QWEN_TTS_MAX_ITEMS` | `32` | Max `text` items in one request |
+| `QWEN_TTS_MAX_CHARS` | `3000` | Max characters per item |
+| `QWEN_TTS_MAX_QUEUE` | `128` | Queued items before returning `503` |
+| `QWEN_TTS_TIMEOUT` | `600` | Seconds before a request gets `504` |
+| `QWEN_TTS_WARMUP` | off | `1` loads all models at boot (recommended in production) |
 
 ### Memory
 
@@ -403,15 +410,80 @@ on the A100, where nothing is ever evicted.
 
 ---
 
-## Concurrency
+## Concurrency and batching
 
-GPU work is serialized behind a single lock: one generation at a time, the rest queue,
-because the models are not safe to call concurrently across threads. To raise throughput on
-the A100, run several server processes on different ports behind a load balancer — see
-[DEPLOY_RUNPOD.md](DEPLOY_RUNPOD.md). Do not use `uvicorn --workers N`.
+**Concurrent requests are merged into one model pass.** Decoding a step reads all 3.4 GB of
+weights out of VRAM whether it is producing for one caller or twenty, so twenty clips cost
+barely more than one. Requests are queued for a few milliseconds, grouped, and generated
+together.
 
-[test_concurrency.py](test_concurrency.py) fires overlapping requests across modes to verify
-the locking holds.
+Measured on an 8 GB laptop (RTX 4060), warm:
+
+| 4 concurrent requests | Wall clock |
+|---|---|
+| Serial (one at a time) | 58.3 s |
+| Batched | **14.5 s** — 4.02× |
+
+| 8 simultaneous users, `MAX_BATCH=8` | |
+|---|---|
+| Slowest user | **20.4 s** |
+| Audio produced | 28.5 s |
+| Aggregate throughput | **1.40× real time** |
+| Queue wait (p95) | 0.03 s |
+
+Eight people clicking at once are all served in ~20 s on a *laptop* GPU. Serially the same
+work took ~80 s. An A100 with `QWEN_TTS_MAX_BATCH=16` has considerably more headroom again.
+
+You do not have to do anything to get this — just send concurrent requests. Sending a list
+in `text` batches too, and the two compose: several callers each sending lists are all
+merged into one pass.
+
+### How it behaves
+
+- **Idle:** a request waits up to `QWEN_TTS_BATCH_WINDOW_MS` (default 40 ms) for company,
+  then runs alone. Invisible next to a multi-second generation.
+- **Under load:** the queue is already full when a batch finishes, so the next batch forms
+  instantly — nobody waits for the window.
+- **Only compatible requests merge:** same model, and same sampling parameters. A described
+  voice cannot batch with a clone. Requests with custom `temperature` batch only with other
+  requests using that same value, so leave sampling knobs alone unless you need them.
+- **Failures are isolated:** if a batch throws, each request in it is retried alone, so one
+  malformed input cannot fail everyone alongside it.
+
+### Guardrails
+
+| Limit | Default | Response when exceeded |
+|---|---|---|
+| Items per request | 32 | `400` |
+| Characters per item | 3000 | `400` |
+| Items queued server-wide | 128 | `503` + `Retry-After` |
+| Time in queue + generating | 600 s | `504` |
+
+These stop one caller pasting a novel from monopolising the GPU. Tune with
+`QWEN_TTS_MAX_ITEMS`, `QWEN_TTS_MAX_CHARS`, `QWEN_TTS_MAX_QUEUE`, `QWEN_TTS_TIMEOUT`.
+
+### Watching the load
+
+`GET /health` → `load` is the signal for whether you need more capacity:
+
+```json
+"load": {
+  "generating_items": 4,
+  "queued_items": 7,
+  "queue_wait_p50_seconds": 1.2,
+  "queue_wait_p95_seconds": 8.4,
+  "avg_batch_size": 5.3,
+  "max_batch_size_seen": 16,
+  "completed": 1204, "failed": 2, "rejected_overload": 0
+}
+```
+
+`queued_items` near zero and `avg_batch_size` near 1 means you have spare capacity.
+A climbing `queue_wait_p95_seconds` means you need a bigger `QWEN_TTS_MAX_BATCH`, a second
+process, or a second GPU.
+
+[test_concurrency.py](test_concurrency.py) fires overlapping requests across modes and is the
+quickest way to see the behaviour under real contention.
 
 ---
 
