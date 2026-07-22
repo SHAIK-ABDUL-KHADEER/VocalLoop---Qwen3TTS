@@ -312,7 +312,27 @@ curl -s -X POST $API/v1/speak -H "Content-Type: application/json" \
 # 401 - only when the server has QWEN_TTS_API_KEY set
 curl -s -X POST $API/v1/speak -H "Content-Type: application/json" \
   -d '{"text":"x","speaker":"ryan"}'
+
+# 400 - more than 32 items in one request (QWEN_TTS_MAX_ITEMS)
+./venv/Scripts/python.exe -c "
+import json; json.dump({'text':['hi']*40,'speaker':'ryan'}, open('too_many.json','w'))"
+curl -s -X POST $API/v1/speak -H "Content-Type: application/json" -d @too_many.json
+
+# 400 - a single item over 3000 characters (QWEN_TTS_MAX_CHARS)
+./venv/Scripts/python.exe -c "
+import json; json.dump({'text':'x'*4000,'speaker':'ryan'}, open('too_long.json','w'))"
+curl -s -X POST $API/v1/speak -H "Content-Type: application/json" -d @too_long.json
+
+# 502 - reference URL the server cannot fetch
+curl -s -X POST $API/v1/speak -H "Content-Type: application/json" \
+  -d '{"text":"x","audio":"https://example.invalid/nope.wav"}'
 ```
+
+Two more you will not trigger by hand, but your site should handle:
+
+- **`503 Server is at capacity`** with a `Retry-After: 5` header — the queue is full. Back off
+  and retry; do not hammer.
+- **`504 Generation exceeded 600s`** — a single request too large to finish. Split the text.
 
 ---
 

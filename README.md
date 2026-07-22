@@ -23,7 +23,16 @@ curl -X POST http://127.0.0.1:9000/v1/speak \
 Two metadata endpoints support it — `GET /v1/voices` (populate your picker) and
 `GET /health` (status). That is the whole API.
 
-**→ [ENDPOINTS.md](ENDPOINTS.md)** for every field, mode, error code, and JS examples.
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| **[PROJECT.md](PROJECT.md)** | **How the whole thing works** — architecture, request lifecycle, batching, why it is built this way |
+| [ENDPOINTS.md](ENDPOINTS.md) | API reference — every field, mode, error code, JS examples |
+| [CURL_EXAMPLES.md](CURL_EXAMPLES.md) | Runnable curl for every flow, all verified |
+| [DEPLOY_RUNPOD.md](DEPLOY_RUNPOD.md) | Deploying to a RunPod A100, no Docker |
+| [voices/README.md](voices/README.md) | Adding vocalist voices |
+| [Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md) | Provenance of the vendored library |
 
 ## Why one endpoint
 

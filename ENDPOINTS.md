@@ -209,12 +209,14 @@ heavy accents.
 
 | Status | Meaning |
 |---|---|
-| `400` | `response_format:"wav"` with a batch, a mismatched list length, or unreadable audio |
+| `400` | `response_format:"wav"` with a batch · mismatched list length · unreadable audio · body is neither JSON nor multipart · **more than 32 items** · **an item over 3000 characters** |
 | `401` | Missing/incorrect `X-API-Key` (only when the server has a key configured) |
 | `404` | Unknown `voice_id` — the message lists the available ids |
 | `422` | Missing `text`; two voice sources; or no voice source **and** no `instruct` |
 | `500` | Unknown `speaker`, or a generation failure |
-| `503` | A required model is not downloaded on the server |
+| `502` | The server could not fetch the URL given in `audio` |
+| `503` | A required model is not downloaded · **or the queue is full** (with `Retry-After`) |
+| `504` | Request exceeded the 600 s budget — split the text |
 
 `422` bodies use FastAPI's shape — a `detail` array with a `msg` per problem.
 

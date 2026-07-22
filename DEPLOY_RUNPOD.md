@@ -1,12 +1,35 @@
-﻿# Deploying to RunPod (no Docker)
+# Deploying to RunPod (no Docker)
 
-Target: an **A100 80 GB** pod running the API for your website.
+Target: an **A100 80 GB** pod serving the API to your website.
 
-> **Code edits required: none.**
-> Everything that differs between your laptop and the A100 — device, how many models stay
-> resident, where Whisper runs, attention kernel, auth, CORS — is auto-detected or set via
-> environment variables. You deploy the same [server/app.py](server/app.py) unchanged.
-> Confirm what it chose with `GET /health` → `config`.
+Every step below is a command you can paste. Roughly **45–60 minutes** end to end, most of it
+waiting for the model download and the optional FlashAttention build.
+
+---
+
+## What you must change in the code
+
+**Nothing.**
+
+Everything that differs between your laptop and the A100 is either auto-detected from the
+hardware or set with an environment variable. You deploy [server/app.py](server/app.py)
+exactly as it is in git.
+
+| Concern | How it is handled |
+|---|---|
+| GPU vs CPU | Auto-detected |
+| How many models stay in VRAM | Auto — 3 on a ≥24 GB card |
+| Where Whisper runs | Auto — GPU on a ≥16 GB card |
+| Attention kernel | Auto — FlashAttention 2 if installed |
+| Batch size | Auto — 16 on a ≥24 GB card |
+| Model / voice paths | Repo-relative by default |
+| API key, CORS, host, port | Environment variables (§4) |
+
+Verify what it chose with `GET /health` → `config` (§6).
+
+The **only** edits you might ever make are optional behaviour changes — a different queue
+limit, a different timeout — and even those are environment variables first. If you find
+yourself editing Python to deploy, something has gone wrong; check §4 instead.
 
 ---
 
@@ -19,20 +42,21 @@ RunPod → **Pods** → **Deploy**.
 | GPU | A100 80 GB (PCIe or SXM) |
 | Template | **RunPod PyTorch** (any recent CUDA 12.x image) |
 | Container disk | 30 GB |
-| Volume disk | **80 GB**, mounted at `/workspace` |
+| Volume disk | **60 GB**, mounted at `/workspace` |
 | Expose HTTP ports | `9000` |
 
-Put the models on the **volume** (`/workspace`), not the container disk — the container disk
-is wiped when the pod is rebuilt, and you do not want to re-download 14 GB each time.
+Put everything on the **volume** (`/workspace`). The container disk is wiped when the pod is
+rebuilt, and you do not want to re-download 14 GB each time.
 
-Once running, open a **Web Terminal** or connect over SSH.
+Once it is running, open a **Web Terminal** or connect over SSH (the pod's Connect page shows
+the exact command).
 
 ---
 
 ## 2. Install
 
-Clone **this** repo. It contains both the API server and a vendored copy of the Qwen3-TTS
-library in `Qwen3-TTS/`, so nothing else needs fetching:
+Clone this repo. It contains both the API and a vendored copy of the Qwen3-TTS library, so
+nothing else needs fetching:
 
 ```bash
 cd /workspace
@@ -44,34 +68,38 @@ source venv/bin/activate
 pip install -U pip
 ```
 
-Install PyTorch matching the pod's CUDA (the PyTorch template usually ships it already —
-check with `python -c "import torch;print(torch.__version__, torch.version.cuda)"` and skip
-this if it prints a CUDA build):
+**PyTorch** — the RunPod PyTorch template usually ships it. Check first:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+If that prints a CUDA build and `True`, skip ahead. Otherwise:
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Then the TTS engine and the API's own dependencies:
+**The TTS engine and API dependencies:**
 
 ```bash
 pip install -e ./Qwen3-TTS
 pip install fastapi "uvicorn[standard]" python-multipart requests
 ```
 
-> `pip install -e ./Qwen3-TTS` installs the vendored library, which also pulls in
-> transformers, accelerate, librosa, soundfile and onnxruntime. It is byte-identical to
-> `qwen-tts` 0.1.1 on PyPI — `pip install -U qwen-tts` is an equivalent substitute. See
-> [Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md) for provenance and how to update it.
+> `pip install -e ./Qwen3-TTS` installs the vendored library, which pulls in transformers,
+> accelerate, librosa, soundfile and onnxruntime. It is identical to `qwen-tts` 0.1.1 on
+> PyPI — `pip install -U qwen-tts` is an equivalent substitute. See
+> [Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md).
 
-**FlashAttention 2** — worth it on Linux, and the server picks it up automatically:
+**FlashAttention 2** (optional, recommended). The server picks it up automatically:
 
 ```bash
 MAX_JOBS=4 pip install flash-attn --no-build-isolation
 ```
 
-This compiles and takes 10–30 minutes. If it fails, skip it — the server falls back to
-`sdpa` on its own. Verify afterwards with `GET /health` → `config.attn_implementation`.
+This compiles from source — **10–30 minutes**. If it fails, skip it; the server falls back to
+`sdpa` on its own. Confirm afterwards via `/health` → `config.attn_implementation`.
 
 ---
 
@@ -89,8 +117,23 @@ hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base        --local-dir $MODELS/Qwen3-TTS-1
 hf download openai/whisper-large-v3-turbo        --local-dir $MODELS/whisper-large-v3-turbo
 ```
 
-About **14.2 GB** total. The server looks in `<repo>/models` by default, which is exactly
-this path — no config needed. If you put them elsewhere, set `QWEN_TTS_MODEL_DIR`.
+**~14.2 GB total.** The folder names must match exactly — the server looks for them by name
+in `<repo>/models`, which is where the commands above put them. No configuration needed.
+
+Verify:
+
+```bash
+du -sh $MODELS/*
+```
+
+You should see four directories, roughly 4.2 / 4.2 / 4.2 / 1.6 GB.
+
+### Your vocalist voices
+
+Copy your reference clips into `/workspace/vocalloop/voices/`. The filename stem becomes the
+`voice_id`, and they are picked up without a restart. Delete the two placeholder clips
+(`aria_soul.wav`, `marcus_baritone.wav`) once you have real ones. See
+[voices/README.md](voices/README.md).
 
 ---
 
@@ -99,42 +142,63 @@ this path — no config needed. If you put them elsewhere, set `QWEN_TTS_MODEL_D
 Create `/workspace/vocalloop/.env`:
 
 ```bash
+# --- required for a public deployment ---------------------------------------
 # Bind publicly so RunPod's proxy can reach it
 QWEN_TTS_HOST=0.0.0.0
 QWEN_TTS_PORT=9000
 
-# Require this header on every generation request. Generate with:
+# Require this header on every generation request. Generate one with:
 #   python -c "import secrets; print(secrets.token_urlsafe(32))"
 QWEN_TTS_API_KEY=<paste-a-long-random-string>
 
 # Only your site may call the API from a browser
 QWEN_TTS_CORS_ORIGINS=https://yoursite.com,https://www.yoursite.com
 
-# Batch up to 16 concurrent requests into one model pass. The default is already
-# 16 on a >=24 GB card; raise it if /health shows the queue backing up.
-QWEN_TTS_MAX_BATCH=16
-
-# Load all models at boot so the first real caller does not pay the 10-30s load.
+# --- recommended -------------------------------------------------------------
+# Load all models at boot so the first real user does not wait 10-30s
 QWEN_TTS_WARMUP=1
 ```
 
-Everything else auto-detects. On an A100 80 GB you should see:
+Everything else auto-detects. **Do not set `QWEN_TTS_MAX_RESIDENT`, `QWEN_TTS_ASR_DEVICE`,
+`QWEN_TTS_DEVICE` or `QWEN_TTS_MAX_BATCH` on the A100** — the defaults are already correct
+there, and forcing them is a common way to make things worse.
 
-| Setting | Auto-chosen value | Why |
+### Full environment variable reference
+
+| Variable | Default on A100 | Purpose |
+|---|---|---|
+| `QWEN_TTS_HOST` / `QWEN_TTS_PORT` | `127.0.0.1` / `9000` | Bind address. **Must set host to `0.0.0.0`** |
+| `QWEN_TTS_API_KEY` | unset → open | Require this in an `X-API-Key` header |
+| `QWEN_TTS_CORS_ORIGINS` | `*` | Comma-separated allowed browser origins |
+| `QWEN_TTS_WARMUP` | off | `1` preloads every model at boot |
+| `QWEN_TTS_MODEL_DIR` | `<repo>/models` | Where the model folders live |
+| `QWEN_TTS_VOICE_DIR` | `<repo>/voices` | Vocalist clips + `voices.json` |
+| `QWEN_TTS_DEVICE` | `cuda:0` | Compute device |
+| `QWEN_TTS_MAX_RESIDENT` | `3` | Models kept in VRAM |
+| `QWEN_TTS_ASR_DEVICE` | `cuda:0` | Where Whisper runs |
+| `QWEN_TTS_ATTN` | `flash_attention_2` if installed | Attention kernel |
+| `QWEN_TTS_MAX_BATCH` | `16` | Requests merged into one model pass |
+| `QWEN_TTS_BATCH_WINDOW_MS` | `40` | How long an idle request waits for company |
+| `QWEN_TTS_MAX_ITEMS` | `32` | Max `text` items per request → `400` |
+| `QWEN_TTS_MAX_CHARS` | `3000` | Max characters per item → `400` |
+| `QWEN_TTS_MAX_QUEUE` | `128` | Queued items before `503` |
+| `QWEN_TTS_TIMEOUT` | `600` | Seconds before `504` |
+
+### What the A100 auto-selects
+
+| Setting | Value | Why |
 |---|---|---|
 | `device` | `cuda:0` | GPU present |
-| `max_resident` | `3` | ≥24 GB VRAM, so all three TTS models stay loaded |
-| `asr_device` | `cuda:0` | ≥16 GB VRAM, so Whisper runs on GPU (~10× faster) |
-| `attn_implementation` | `flash_attention_2` | if flash-attn installed, else `sdpa` |
-| `max_batch_items` | `16` | ≥24 GB VRAM, so concurrent requests merge 16 at a time |
+| `max_resident` | `3` | ≥24 GB, so all three TTS models stay loaded |
+| `asr_device` | `cuda:0` | ≥16 GB, so Whisper runs on GPU (~10× faster) |
+| `attn_implementation` | `flash_attention_2` | if flash-attn installed |
+| `max_batch_items` | `16` | ≥24 GB, so 16 requests merge per pass |
 
-Total resident: **14.2 GB of 80 GB**. Nothing ever evicts or reloads.
+**Total resident: 14.2 GB of 80 GB.** Nothing ever evicts or reloads.
 
-> **Why this matters.** On the 8 GB laptop the server keeps only one TTS model resident and
-> pushes Whisper to the CPU, because there is not enough VRAM for more. Model eviction on a
-> small card also proved genuinely unstable — repeatedly freeing a 4 GB model crashed the
-> CUDA process outright. On the A100 none of that applies: everything is resident on the GPU
-> from the first request and eviction never happens.
+> On the 8 GB laptop the server keeps one model resident and pushes Whisper to the CPU,
+> because there is not room for more — and repeated eviction of a 4 GB model proved genuinely
+> unstable there. None of that applies on the A100.
 
 ---
 
@@ -147,37 +211,40 @@ set -a && source .env && set +a
 python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
 ```
 
-Watch the startup lines — they print the resolved config:
+The startup lines print the resolved configuration:
 
 ```
 [startup] gpu          : NVIDIA A100-SXM4-80GB (79.2 GB)
 [startup] device       : cuda:0
+[startup] model dir    : /workspace/vocalloop/models
+[startup] voice dir    : /workspace/vocalloop/voices (2 vocalist voices)
 [startup] max resident : 3
 [startup] attn impl    : flash_attention_2
 [startup] asr model    : .../whisper-large-v3-turbo on cuda:0
 [startup] auth         : X-API-Key required
+[startup] cors origins : ['https://yoursite.com']
 [startup] batching     : up to 16 items, 40ms window
 [startup] limits       : 32 items/req, 3000 chars/item, queue 128, timeout 600s
 [startup] warmed up    : ['voice_design', 'custom_voice', 'base']
 ```
 
-If `device` says `cpu` or `asr model ... on cpu`, stop and fix it — you are not on the GPU.
+**If `device` says `cpu`, or `asr model … on cpu`, stop and fix it** — you are not on the GPU
+and everything will be unusably slow.
 
-### Keep it running after you disconnect
+### Keeping it running
 
-A RunPod pod is a container, and **there is no systemd inside it** — `systemctl` fails with
-"System has not been booted with systemd as init system". Use one of these instead.
+A RunPod pod is a container and **has no systemd** — `systemctl` fails with "System has not
+been booted with systemd as init system". Use one of these.
 
 **tmux**, for interactive work:
 
 ```bash
 tmux new -s tts
-# start the server as above, then detach with Ctrl-B then D
-# come back later with: tmux attach -t tts
+# start the server, detach with Ctrl-B then D, return with: tmux attach -t tts
 ```
 
-**A supervised background process**, to survive disconnects and restart on crash. Save this
-as `/workspace/vocalloop/run.sh`:
+**A supervised background process**, to survive disconnects and restart on crash. Save as
+`/workspace/vocalloop/run.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -200,9 +267,8 @@ tail -f /workspace/vocalloop/server.log
 The restart loop matters: a CUDA OOM can kill the process outright with no traceback, and
 without it the pod keeps billing while serving nothing.
 
-**Start it automatically when the pod boots.** Nothing under `/workspace` runs on its own —
-put the command in the pod's *Container Start Command* (Edit Pod → Docker Command), or
-append it to the template's startup script:
+**Start automatically on pod boot.** Nothing under `/workspace` runs on its own — put this in
+the pod's *Container Start Command* (Edit Pod → Docker Command):
 
 ```bash
 bash -c "/workspace/vocalloop/run.sh"
@@ -212,47 +278,73 @@ bash -c "/workspace/vocalloop/run.sh"
 
 ## 6. Verify
 
-Your public URL is `https://<POD_ID>-9000.proxy.runpod.net` (shown on the pod's Connect page).
+Your public URL is `https://<POD_ID>-9000.proxy.runpod.net`, shown on the pod's Connect page.
+
+**Health first** — `/health` needs no API key, so probes work:
 
 ```bash
 curl https://<POD_ID>-9000.proxy.runpod.net/health
 ```
 
-`/health` stays open so RunPod's probes work. Confirm `config.device` is `cuda:0` and
-`config.asr_device` is `cuda:0`.
+Confirm `config.device` and `config.asr_device` are both `cuda:0`, and
+`models_downloaded` is all `true`.
 
-Run the full suite against the deployed server (needs `requests` installed wherever you run
-it from):
+**Generate something:**
 
 ```bash
-python test_endpoints.py \
-  --base-url https://<POD_ID>-9000.proxy.runpod.net \
-  --api-key "$QWEN_TTS_API_KEY"
+curl -X POST https://<POD_ID>-9000.proxy.runpod.net/v1/speak \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $QWEN_TTS_API_KEY" \
+  -d '{"text":"Deployment successful.","speaker":"ryan","response_format":"wav"}' \
+  --output test.wav
 ```
 
-`--api-key` also reads the `QWEN_TTS_API_KEY` environment variable, so inside the pod
-`python test_endpoints.py` picks it up from `.env` with no extra flags. All 28 checks should
-pass. Expect roughly 5–10 minutes over the public proxy.
+**Run the full suite** (28 checks). Easiest from inside the pod, where `.env` supplies the key:
 
-A first-call warm-up of ~10–20 s per model is normal. After that all three TTS models and
-Whisper stay resident and nothing reloads.
+```bash
+cd /workspace/vocalloop && source venv/bin/activate
+set -a && source .env && set +a
+python test_endpoints.py
+```
+
+From your laptop, pass the key and URL:
+
+```bash
+python test_endpoints.py --base-url https://<POD_ID>-9000.proxy.runpod.net --api-key "<key>"
+```
+
+All 28 should pass. Expect 5–10 minutes over the public proxy.
+
+**Check concurrency** — what 8 simultaneous users actually experience:
+
+```bash
+python test_concurrency.py --workers 8 --rounds 2
+```
+
+It reports `avg_batch_size` at the end. Anything above 1 means batching is engaging.
+
+**Record the ceiling** (optional, ~10 minutes) so future capacity planning uses real numbers:
+
+```bash
+python bench.py
+```
 
 ---
 
 ## 7. Point your website at it
 
-There is one endpoint, `POST /v1/speak`, and the fields you send pick the mode:
+One endpoint, `POST /v1/speak`; the fields you send select the mode:
 
 ```js
 const API = "https://<POD_ID>-9000.proxy.runpod.net";
-const KEY = process.env.QWEN_TTS_API_KEY;   // server-side only, never ship to the browser
+const KEY = process.env.QWEN_TTS_API_KEY;   // server-side only
 
 const res = await fetch(`${API}/v1/speak`, {
   method: "POST",
   headers: { "Content-Type": "application/json", "X-API-Key": KEY },
   body: JSON.stringify({
     text,
-    // exactly one of these three, or none of them with `instruct`:
+    // exactly one of these three, or none of them plus `instruct`:
     speaker,        // built-in voice   -> built_in_voice
     // voice_id,    // vocalist library -> vocalist_clone
     // audio,       // url/base64 clip  -> voice_clone
@@ -263,95 +355,96 @@ const res = await fetch(`${API}/v1/speak`, {
 });
 ```
 
-For an uploaded file, post `multipart/form-data` to the same URL with the clip in an
+For a user-uploaded file, post `multipart/form-data` to the same URL with the clip in an
 `audio` field. Populate your voice picker from `GET /v1/voices`, which returns built-in
-voices, vocalist voices, and languages in one call.
+voices, vocalist voices and languages in one call.
 
-**Do not put the API key in browser JavaScript** — anyone could read it and spend your GPU
+⚠️ **Never put the API key in browser JavaScript.** Anyone could read it and spend your GPU
 time. Proxy these calls through your own backend, which holds the key. If you must call
-directly from the browser, leave `QWEN_TTS_API_KEY` unset and instead restrict
-`QWEN_TTS_CORS_ORIGINS` to your domain, understanding that CORS is not real access control.
+directly from the browser, leave `QWEN_TTS_API_KEY` unset and restrict
+`QWEN_TTS_CORS_ORIGINS` to your domain — understanding that CORS is not access control, only
+a browser convention.
 
-See [ENDPOINTS.md](ENDPOINTS.md) for the full request/response reference.
+Full reference: [ENDPOINTS.md](ENDPOINTS.md). Runnable examples:
+[CURL_EXAMPLES.md](CURL_EXAMPLES.md).
 
 ---
 
-## Operational notes
+## 8. Operating it
 
-**Concurrency — run ONE process.** The server batches concurrent requests into a single
-model pass, so one process uses the GPU far better than several competing ones. Measured on
-an 8 GB laptop: 4 concurrent requests took 14.5 s batched versus 58.3 s serial (**4×**), and
-8 simultaneous users were all served in 20.4 s at 1.40× real-time throughput. An A100 with
-`QWEN_TTS_MAX_BATCH=16` has considerably more headroom again.
+**Run ONE process.** The server batches concurrent requests into a single model pass, so one
+process uses the GPU far better than several competing ones. Measured on an 8 GB laptop:
+4 concurrent requests took 14.5 s batched versus 58.3 s serial (**4×**), and 8 simultaneous
+users were all served in 20.4 s.
 
-Running several processes would be *worse*: each loads its own 14.2 GB (so only ~5 fit), and
-they would split the traffic into smaller batches while contending for the same GPU. One
-process with a big batch beats five processes with small ones.
+Several processes would be *worse*: each loads its own 14.2 GB (so only ~5 fit), and they
+split traffic into smaller batches while contending for the same GPU. Do **not** use
+`uvicorn --workers N` either — same problem, plus VRAM pressure.
 
-Do **not** use `uvicorn --workers N` either — every worker loads its own models with no
-shared queue, which is the same problem plus VRAM pressure.
-
-Scale by raising `QWEN_TTS_MAX_BATCH` first, and only then by adding a second GPU. Check
-`GET /health` → `load` to see whether you actually need to:
-
-```json
-"load": { "queued_items": 7, "queue_wait_p95_seconds": 8.4, "avg_batch_size": 5.3 }
-```
-
-`queued_items` near zero means you have spare capacity. A rising `queue_wait_p95_seconds` is
-the signal to scale. Run [bench.py](bench.py) once on the pod to record the ceiling, and
-[test_concurrency.py](test_concurrency.py) to feel what N simultaneous users experience.
-
-**Cost.** A pod bills while running, whether or not it is serving. Stop it when idle. If
-traffic is bursty, RunPod Serverless suits the workload better, but that route wants a
-container image — out of scope here, since you asked for no Docker.
-
-**Storage.** Keep `/workspace` as a network volume so the 14.2 GB of weights survives pod
-recreation. Rebuilding the container disk alone will not lose them.
-
-**First request is slow.** Models load lazily on first use (~10–20 s each). To warm them up
-at deploy time, fire one request per mode:
+**Scale by raising `QWEN_TTS_MAX_BATCH` first**, then by adding a second GPU. The signal:
 
 ```bash
-H="Content-Type: application/json"
-K="X-API-Key: $QWEN_TTS_API_KEY"
-REF=https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav
-
-# CustomVoice
-curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
-  -d '{"text":"warm up","speaker":"ryan"}'
-# VoiceDesign
-curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
-  -d '{"text":"warm up","instruct":"a calm voice"}'
-# Base + Whisper
-curl -X POST localhost:9000/v1/speak -H "$H" -H "$K" \
-  -d "{\"text\":\"warm up\",\"audio\":\"$REF\"}"
+curl -s https://<POD_ID>-9000.proxy.runpod.net/health | python -m json.tool
 ```
 
-**Vocalist voices.** Copy your reference clips into `/workspace/vocalloop/voices/` — the
-filename stem becomes the `voice_id`. They are picked up without a restart. Keeping them on
-the volume means transcripts stay cached across pod restarts. See
-[voices/README.md](voices/README.md).
+```json
+"load": { "queued_items": 7, "queue_wait_p95_seconds": 8.4, "avg_batch_size": 5.3,
+          "completed": 1204, "failed": 2, "rejected_overload": 0 }
+```
+
+- `queued_items` near zero → spare capacity.
+- `queue_wait_p95_seconds` climbing → raise the batch size, or add GPU.
+- `rejected_overload` above zero → users are getting `503`; raise `QWEN_TTS_MAX_QUEUE` only
+  if the GPU can actually keep up, otherwise you are just hiding the queue.
+
+**Cost.** A pod bills while running, whether or not it is serving. Stop it when idle. If
+traffic is bursty, RunPod Serverless suits the workload better — but that route wants a
+container image, which is out of scope here.
+
+**Storage.** Keep `/workspace` on a network volume so the 14.2 GB of weights and your
+vocalist clips survive pod recreation.
+
+**Updating.** `git pull` in `/workspace/vocalloop`, then restart the server. Models and
+voices live outside git, so they are untouched.
 
 ---
 
-## Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | `config.device` is `cpu` | No CUDA in the venv. Reinstall torch with the right `--index-url`. |
-| `config.asr_device` is `cpu` on the A100 | VRAM read below 16 GB, or `QWEN_TTS_ASR_DEVICE=cpu` left in `.env`. Remove it. |
-| `503 Model 'x' is not downloaded` | Wrong `QWEN_TTS_MODEL_DIR`, or a download did not finish. Folder names must match section 3 exactly. |
-| `index is on cpu, different from other tensors on cuda:0` | Not enough free VRAM, so a model loaded split across devices. Should not happen on an A100 — check nothing else is using the GPU (`nvidia-smi`). |
-| `401 Invalid or missing X-API-Key` | Send the `X-API-Key` header, or unset `QWEN_TTS_API_KEY`. |
-| CORS errors in the browser | Set `QWEN_TTS_CORS_ORIGINS` to your exact origin, scheme included. |
+| `config.asr_device` is `cpu` on the A100 | `QWEN_TTS_ASR_DEVICE=cpu` left in `.env`. Remove it. |
+| `503 Model 'x' is not downloaded` | Wrong `QWEN_TTS_MODEL_DIR`, or a download did not finish. Folder names must match §3 exactly. |
+| `503 Server is at capacity` | Queue is full — the GPU cannot keep up with arrivals. Expected under overload; raise `QWEN_TTS_MAX_BATCH` or add GPU. |
+| `504 Generation exceeded 600s` | A very large request. Split the text, or raise `QWEN_TTS_TIMEOUT`. |
+| `400 … exceeds the limit of 32` | More than `QWEN_TTS_MAX_ITEMS` items. Split into several requests — also faster. |
+| `502 Could not fetch reference audio` | The server could not download the URL in `audio`. Check outbound access, or upload the clip instead. |
+| `404 Unknown voice_id` | Clip not in `QWEN_TTS_VOICE_DIR`. The id is the filename without extension; the error lists valid ids. |
+| `401 Invalid or missing X-API-Key` | Send the header, or unset `QWEN_TTS_API_KEY`. |
+| `422` two voice sources | Sent more than one of `speaker` / `voice_id` / `audio`. Clear the others when the user switches. |
+| `index is on cpu, different from other tensors on cuda:0` | Not enough free VRAM, so a model loaded split across devices. Should not happen on an A100 — check `nvidia-smi` for other processes. |
+| `systemctl: command not found` | Expected — a pod is a container. Use `run.sh` + `nohup`, or tmux (§5). |
+| `ModuleNotFoundError: qwen_tts` | venv not active, or `pip install -e ./Qwen3-TTS` skipped. |
 | Server dies with no traceback | Almost always OOM. Check `nvidia-smi`; make sure only one server process is running. |
-| Port not reachable | Port `9000` must be in the pod's exposed HTTP ports, and the server bound to `0.0.0.0`, not `127.0.0.1`. |
-| `systemctl: command not found` / "not been booted with systemd" | Expected — a pod is a container. Use `run.sh` + `nohup`, or tmux. See section 5. |
-| `ModuleNotFoundError: qwen_tts` | The venv is not active, or `pip install -e ./Qwen3-TTS` was skipped. |
-| `404 Unknown voice_id` | The clip is not in `QWEN_TTS_VOICE_DIR`. The `voice_id` is the filename without its extension; the error lists what is available. |
-| `502 Could not fetch reference audio` | The server could not download the URL you passed as `audio`. Check the pod has outbound access, or upload the clip instead. |
-| Everything works, then dies after a few requests | Repeated model eviction on a small GPU. Not applicable on an A100 unless `QWEN_TTS_MAX_RESIDENT` was forced to `1`; drop the override. |
+| Port not reachable | `9000` must be in the pod's exposed HTTP ports, and the server bound to `0.0.0.0`. |
+| CORS errors in the browser | Set `QWEN_TTS_CORS_ORIGINS` to your exact origin, scheme included. |
 
-If you get stuck, `GET /health` answers most questions at once — it reports the device, ASR
-placement, which models are loaded, which are downloaded, and whether auth is on.
+`GET /health` answers most of these at once — device, ASR placement, which models are loaded,
+which are downloaded, queue state, and whether auth is on.
+
+---
+
+## 10. Pre-launch checklist
+
+- [ ] `/health` shows `device: cuda:0` and `asr_device: cuda:0`
+- [ ] `models_downloaded` all `true`
+- [ ] `QWEN_TTS_API_KEY` set, and a request without it returns `401`
+- [ ] `QWEN_TTS_CORS_ORIGINS` restricted to your domain, not `*`
+- [ ] API key held server-side only, never in browser JavaScript
+- [ ] `test_endpoints.py` — 28/28 passing against the deployed URL
+- [ ] `test_concurrency.py --workers 8` — acceptable latency, `avg_batch_size` above 1
+- [ ] Your real vocalist clips in `voices/`, placeholders removed
+- [ ] Server runs under `run.sh` + `nohup` (or tmux), restarts on crash
+- [ ] Container Start Command set, so it survives a pod reboot
+- [ ] `/workspace` is a network volume, so weights survive recreation
