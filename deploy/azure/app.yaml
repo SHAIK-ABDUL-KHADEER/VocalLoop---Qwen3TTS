@@ -1,0 +1,67 @@
+# Azure Container App definition for the Qwen3-TTS API. See DEPLOY_AZURE.md §5.
+#
+# A template: ${VARS} are filled in by envsubst from your Cloud Shell variables.
+# The rendered copy contains secrets, so DEPLOY_AZURE.md deletes it after use.
+
+location: ${LOC}
+type: Microsoft.App/containerApps
+properties:
+  managedEnvironmentId: ${ENV_ID}
+  workloadProfileName: gpu
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: auto
+      allowInsecure: false
+    registries:
+      - server: ${ACR}.azurecr.io
+        username: ${ACR}
+        passwordSecretRef: acr-password
+    secrets:
+      - name: acr-password
+        value: "${ACR_PASSWORD}"
+      - name: api-key
+        value: "${API_KEY}"
+  template:
+    containers:
+      - name: qwen-tts
+        image: ${ACR}.azurecr.io/qwen-tts:latest
+        # The full A100 consumption GPU slice: 24 vCPU, 220 GiB, 1x A100 80 GB.
+        resources:
+          cpu: 24
+          memory: 220Gi
+        env:
+          # The Azure Files share is mounted at /mnt/tts (volumeMounts below).
+          - name: QWEN_TTS_MODEL_DIR
+            value: /mnt/tts/models
+          - name: QWEN_TTS_VOICE_DIR
+            value: /mnt/tts/voices
+          - name: QWEN_TTS_API_KEY
+            secretRef: api-key
+          - name: QWEN_TTS_CORS_ORIGINS
+            value: "${CORS}"
+          # Off: models load on first use, so the port opens fast and the
+          # startup probe passes. On, 14 GB is read from the share first.
+          - name: QWEN_TTS_WARMUP
+            value: "0"
+          # Container Apps ingress cuts HTTP requests at 240 s. Time out just
+          # before that so callers get the server's clean JSON 504.
+          - name: QWEN_TTS_TIMEOUT
+            value: "230"
+        volumeMounts:
+          - volumeName: tts
+            mountPath: /mnt/tts
+    volumes:
+      - name: tts
+        storageType: AzureFile
+        storageName: tts
+    scale:
+      minReplicas: 0       # scale to zero when idle
+      maxReplicas: 1       # one replica batches everything on one GPU
+      rules:
+        - name: http
+          http:
+            metadata:
+              concurrentRequests: "32"
