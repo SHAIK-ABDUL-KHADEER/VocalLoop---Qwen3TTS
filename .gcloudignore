@@ -1,0 +1,9 @@
+# What `gcloud builds submit` uploads as the build context. Allowlist only, so the
+# 14 GB models/ folder and venv/ can never be uploaded by accident.
+*
+!Dockerfile
+!.dockerignore
+!Qwen3-TTS/
+!Qwen3-TTS/**
+!server/
+!server/**

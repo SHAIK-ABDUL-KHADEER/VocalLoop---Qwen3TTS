@@ -1,0 +1,13 @@
+# Only Qwen3-TTS/ and server/ go into the image. Weights and voices come from the
+# Cloud Storage bucket at runtime.
+*
+!Qwen3-TTS/
+!server/
+
+Qwen3-TTS/assets/
+Qwen3-TTS/examples/
+Qwen3-TTS/finetuning/
+**/__pycache__/
+**/*.egg-info/
+**/*.wav
+server/app_full.py

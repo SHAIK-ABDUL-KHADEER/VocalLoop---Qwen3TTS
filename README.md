@@ -31,6 +31,7 @@ Two metadata endpoints support it — `GET /v1/voices` (populate your picker) an
 | [ENDPOINTS.md](ENDPOINTS.md) | API reference — every field, mode, error code, JS examples |
 | [CURL_EXAMPLES.md](CURL_EXAMPLES.md) | Runnable curl for every flow, all verified |
 | [DEPLOY_RUNPOD.md](DEPLOY_RUNPOD.md) | Deploying to a RunPod A100, no Docker |
+| [DEPLOY_GCP.md](DEPLOY_GCP.md) | Deploying to Google Cloud Run (serverless L4 GPU) + Cloud Storage |
 | [voices/README.md](voices/README.md) | Adding vocalist voices |
 | [Qwen3-TTS/VENDORED.md](Qwen3-TTS/VENDORED.md) | Provenance of the vendored library |
 
@@ -111,6 +112,9 @@ checkout without losing anything.
 
 **→ [DEPLOY_RUNPOD.md](DEPLOY_RUNPOD.md)** — RunPod A100, no Docker. Pod setup, install,
 model download, auth, systemd unit, verification, troubleshooting.
+
+**→ [DEPLOY_GCP.md](DEPLOY_GCP.md)** — Google Cloud Run with a serverless L4 GPU that scales
+to zero, models in a Cloud Storage bucket. Uses the [Dockerfile](Dockerfile).
 
 No code edits are required to deploy; everything is environment-driven.
 

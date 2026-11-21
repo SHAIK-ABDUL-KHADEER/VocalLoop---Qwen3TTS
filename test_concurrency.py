@@ -4,30 +4,35 @@ This reproduces the eviction race: with `registry.get()` outside `gpu_lock`, one
 request could evict (and `.to("cpu")`) a model while another was mid-generation
 on it, raising "index is on cpu, different from other tensors on cuda:0".
 
-    python test_concurrency.py [--base-url ...] [--rounds 4] [--workers 4]
+    python test_concurrency.py [--base-url ...] [--api-key ...] [--rounds 4] [--workers 4]
 """
 
 import argparse
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+HEADERS = {}
+
+
 # Alternating model families - every adjacent pair forces an evict+load when
 # MAX_RESIDENT=1, which is exactly the window the race lived in.
 def payloads(base):
+    url = f"{base}/v1/speak"
     ref = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
     ref_text = ("Okay. Yeah. I resent you. I love you. I respect you. But you know what? "
                 "You blew it! And thanks to you.")
     return [
-        ("described", f"{base}/v1/tts",
+        ("described", url,
          {"text": "A described voice speaks.", "instruct": "A calm narrator.", "language": "english"}),
-        ("built_in", f"{base}/v1/tts",
+        ("built_in", url,
          {"text": "A built-in voice speaks.", "speaker": "ryan", "language": "english"}),
-        ("clone", f"{base}/v1/tts/clone",
-         {"text": "A cloned voice speaks.", "ref_audio": ref, "ref_text": ref_text,
+        ("clone", url,
+         {"text": "A cloned voice speaks.", "audio": ref, "ref_text": ref_text,
           "language": "english"}),
-        ("built_in2", f"{base}/v1/tts",
+        ("built_in2", url,
          {"text": "Another built-in voice speaks.", "speaker": "vivian", "language": "english"}),
     ]
 
@@ -35,7 +40,7 @@ def payloads(base):
 def fire(job):
     label, url, body = job
     try:
-        r = requests.post(url, json=body, timeout=1200)
+        r = requests.post(url, json=body, headers=HEADERS, timeout=1200)
         if r.status_code != 200:
             detail = r.text[:200]
             return label, False, f"HTTP {r.status_code}: {detail}"
@@ -49,8 +54,11 @@ def main():
     ap.add_argument("--base-url", default="http://127.0.0.1:9000")
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--api-key", default=os.environ.get("QWEN_TTS_API_KEY"))
     args = ap.parse_args()
     B = args.base_url.rstrip("/")
+    if args.api_key:
+        HEADERS["X-API-Key"] = args.api_key
 
     jobs = payloads(B) * args.rounds
     print(f"firing {len(jobs)} overlapping requests, {args.workers} at a time\n")
